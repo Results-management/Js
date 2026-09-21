@@ -2270,6 +2270,7 @@ function App() {
   const [showHistory, setShowHistory]       = useState(false);
   const [showComment, setShowComment]       = useState(false);
   const [comment, setComment]               = useState("");
+  const [commentSaved, setCommentSaved]     = useState(false);
   const [searchTerm, setSearchTerm]         = useState("");
   const [prevTermMap, setPrevTermMap]       = useState({});
   const [saved, setSaved]                   = useState(false);
@@ -2557,9 +2558,16 @@ function App() {
   },[page, grade, commentScope, term, year]);
 
   async function saveComment(text) {
+    if (!GH) { alert("Not connected to GitHub. The comment was NOT saved."); return; }
+    const ok = await saveShared(commentKey(grade, commentScope, term, year), text);
+    if (!ok) {
+      alert("The comment could not be saved. Check your internet connection and GitHub token, then tap Save Comment again.");
+      return; // keep the box open so the text isn't lost
+    }
     setComment(text);
-    await saveShared(commentKey(grade, commentScope, term, year), text);
     setShowComment(false);
+    setCommentSaved(true);
+    setTimeout(()=>setCommentSaved(false), 3000);
   }
 
   // ── storage helpers ────────────────────────────────────────────────────
@@ -3307,7 +3315,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
           </div>
           <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
             <button style={S.ghostBtn} onClick={()=>setShowHistory(true)}>📂 History</button>
-            <button style={S.ghostBtn} onClick={()=>setShowComment(true)}>💬 {comment?"Edit":"Add"} Class Comment</button>
+            <button style={{...S.ghostBtn,...(commentSaved?{background:"#e8f5e9",color:"#2e7d32",borderColor:"#2e7d32"}:{})}} onClick={()=>setShowComment(true)}>{commentSaved?"✓ Comment saved":`💬 ${comment?"Edit":"Add"} Class Comment`}</button>
             <input style={{...S.input,maxWidth:160,fontSize:12}} placeholder="🔍 Search learner…"
               value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} />
             <button style={{...S.ghostBtn,...(saved?{background:"#e8f5e9",color:"#2e7d32",borderColor:"#2e7d32"}:{})}}
