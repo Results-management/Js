@@ -948,7 +948,7 @@ function computePathwayScores(scores) {
 }
 const TERMS = ["Mid Term 1","End Term 1","Mid Term 2","End Term 2","Mid Term 3","End Term 3"];
 // Grade 9 sits three assessments in Term 3 instead of Mid Term 3 / End Term 3.
-const TERMS_G9 = ["Mid Term 1","End Term 1","Mid Term 2","End Term 2","Assessment 1","Assessment 2","Final Assessment"];
+const TERMS_G9 = ["Mid Term 1","End Term 1","Mid Term 2","End Term 2","Term 3 Assessment 1","Term 3 Assessment 2","Term 3 Final Assessment"];
 function termsFor(gr) { return String(gr) === "9" ? TERMS_G9 : TERMS; }
 // If the selected term doesn't exist for this grade (e.g. after switching grade), map it to its Term 3 equivalent.
 function normTerm(t, gr) {
@@ -956,12 +956,15 @@ function normTerm(t, gr) {
   if (list.includes(t)) return t;
   const g9 = String(gr) === "9";
   const map = g9
-    ? { "Mid Term 3": "Assessment 1", "End Term 3": "Final Assessment" }
-    : { "Assessment 1": "Mid Term 3", "Assessment 2": "End Term 3", "Final Assessment": "End Term 3" };
+    ? { "Mid Term 3": "Term 3 Assessment 1", "End Term 3": "Term 3 Final Assessment",
+        "Assessment 1": "Term 3 Assessment 1", "Assessment 2": "Term 3 Assessment 2", "Final Assessment": "Term 3 Final Assessment" }
+    : { "Term 3 Assessment 1": "Mid Term 3", "Term 3 Assessment 2": "End Term 3", "Term 3 Final Assessment": "End Term 3",
+        "Assessment 1": "Mid Term 3", "Assessment 2": "End Term 3", "Final Assessment": "End Term 3" };
   return map[t] || list[0];
 }
 function shortTermLabel(t) {
-  return t.replace("Mid Term","MT").replace("End Term","ET").replace("Final Assessment","FA").replace("Assessment 1","A1").replace("Assessment 2","A2");
+  return t.replace("Term 3 Final Assessment","T3 FA").replace("Term 3 Assessment 1","T3 A1").replace("Term 3 Assessment 2","T3 A2")
+          .replace("Mid Term","MT").replace("End Term","ET");
 }
 const YEARS = ["2024","2025","2026","2027","2028","2029","2030","2031","2032"];
 
@@ -1957,6 +1960,13 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
           </div>
         );
       })()}
+
+      {comment && String(comment).trim() && (
+        <div style={{marginBottom:8}}>
+          <div style={RC.sectionTitle}>CLASS TEACHER'S COMMENT</div>
+          <div style={{border:"1px solid #bbb",padding:"6px 8px",fontSize:10.5,minHeight:22,whiteSpace:"pre-wrap",color:"#000"}}>{comment}</div>
+        </div>
+      )}
 
       <div style={RC.bottomRow}>
         <div style={RC.gradingKey}>
