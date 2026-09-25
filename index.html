@@ -2761,7 +2761,7 @@ function App() {
       const classList = classesConfig[grade] || [""];
       let ok = true;
       for (const s of classList) {
-        const data = (learnersByStream[s]||[]).map(l=>({name:l.name,admNo:l.admNo||"",scores:l.scores}));
+        const data = (learnersByStream[s]||[]).map(l=>({name:l.name,admNo:l.admNo||"",gender:l.gender||"",scores:l.scores}));
         ok = await saveShared(learnersKey(grade,s), data) && ok;
         ok = await saveShared(storageKey(grade,s,term,year), data) && ok;
       }
