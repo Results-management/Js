@@ -924,6 +924,12 @@ const GRADES = [
 ];
 
 const SUBJECTS = ["MATH","ENG","KISW","SCIENCE","PRETECH","AGRIC","SOCIAL","RE","C/A"];
+const SUBJECT_FULL = {
+  MATH: "Mathematics", ENG: "English", KISW: "Kiswahili", SCIENCE: "Integrated Science",
+  PRETECH: "Pre-Technical Studies", AGRIC: "Agriculture", SOCIAL: "Social Studies",
+  RE: "Religious Education", "C/A": "Creative Arts"
+};
+function subjectKey(sub){ return SUBJECT_FULL[sub] || sub; }
 
 // ── CBC Career Pathways ─────────────────────────────────────────────────
 // Groups subjects into the three JSS pathway families for the report card's
@@ -1003,14 +1009,26 @@ function calcStats(scores) {
   return { total, points, avg, level };
 }
 
+function meanOf(vals) { return vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2) : "–"; }
+
 function calcSubjectMeans(rankedList) {
   const means = {};
+  const boys = rankedList.filter(l=>l.gender==="M");
+  const girls = rankedList.filter(l=>l.gender==="F");
   SUBJECTS.forEach(sub => {
-    const vals = rankedList.map(l => subjectTotal(l.scores, sub)).filter(v => v !== "" && v > 0);
-    means[sub] = vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2) : "–";
+    const valsOf = list => list.map(l => subjectTotal(l.scores, sub)).filter(v => v !== "" && v > 0);
+    means[sub] = meanOf(valsOf(rankedList));
+    means[sub+"_M"] = meanOf(valsOf(boys));
+    means[sub+"_F"] = meanOf(valsOf(girls));
   });
   const allAvgs = rankedList.filter(l=>l.total>0).map(l=>parseFloat(l.avg));
-  means["_classMean"] = allAvgs.length ? (allAvgs.reduce((a,b)=>a+b,0)/allAvgs.length).toFixed(2) : "–";
+  const boyAvgs = boys.filter(l=>l.total>0).map(l=>parseFloat(l.avg));
+  const girlAvgs = girls.filter(l=>l.total>0).map(l=>parseFloat(l.avg));
+  means["_classMean"] = meanOf(allAvgs);
+  means["_boysMean"] = meanOf(boyAvgs);
+  means["_girlsMean"] = meanOf(girlAvgs);
+  means["_boysCount"] = boys.filter(l=>l.total>0).length;
+  means["_girlsCount"] = girls.filter(l=>l.total>0).length;
   // Mean total marks expressed as a fraction of the maximum possible total
   // (sum of every learner's overall total, divided by number of learners,
   // shown like "370/900").
@@ -1019,6 +1037,20 @@ function calcSubjectMeans(rankedList) {
   means["_meanTotal"] = allTotals.length ? Math.round(allTotals.reduce((a,b)=>a+b,0)/allTotals.length) : 0;
   means["_maxTotal"] = maxTotal;
   return means;
+}
+
+// Top scorer ("subject champion") per subject across a ranked list.
+function calcSubjectChampions(rankedList) {
+  const champs = {};
+  SUBJECTS.forEach(sub => {
+    let best = null;
+    rankedList.forEach(l => {
+      const v = subjectTotal(l.scores, sub);
+      if (v !== "" && v > 0 && (!best || v > best.score)) best = { name: l.name, score: v };
+    });
+    champs[sub] = best;
+  });
+  return champs;
 }
 
 // Compute per-subject rank for every learner across a combined list (East+West merged)
@@ -1583,6 +1615,14 @@ function ResultsAnalysisModal({ ranked, levelCounts, means, label, term, year, s
     .sort((a,b)=>b.total-a.total)
     .slice(0,5);
 
+  const champions = calcSubjectChampions(ranked);
+  const boysMarked = marked.filter(l=>l.gender==="M");
+  const girlsMarked = marked.filter(l=>l.gender==="F");
+  const boysPass = boysMarked.filter(l=>l.level==="EE"||l.level==="ME").length;
+  const girlsPass = girlsMarked.filter(l=>l.level==="EE"||l.level==="ME").length;
+  const boysPassRate = boysMarked.length ? Math.round((boysPass/boysMarked.length)*100) : 0;
+  const girlsPassRate = girlsMarked.length ? Math.round((girlsPass/girlsMarked.length)*100) : 0;
+
   const box = { position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:1000,
     display:"flex", alignItems:"center", justifyContent:"center", padding:12 };
   const panel = { background:"#fff", borderRadius:14, maxWidth:720, width:"100%",
@@ -1680,6 +1720,30 @@ ${inner}
               </div>
             </div>
 
+            <div style={sectionH}>Performance by Gender</div>
+            <div style={statGrid}>
+              <div style={statBox}>
+                <div style={{fontWeight:900, fontSize:22}}>{means["_boysMean"]!=="–"?means["_boysMean"]+"%":"–"}</div>
+                <div style={{fontWeight:700, fontSize:11}}>BOYS MEAN ({boysMarked.length})</div>
+              </div>
+              <div style={statBox}>
+                <div style={{fontWeight:900, fontSize:22}}>{means["_girlsMean"]!=="–"?means["_girlsMean"]+"%":"–"}</div>
+                <div style={{fontWeight:700, fontSize:11}}>GIRLS MEAN ({girlsMarked.length})</div>
+              </div>
+              <div style={statBox}>
+                <div style={{fontWeight:900, fontSize:22}}>{means["_classMean"]!=="–"?means["_classMean"]+"%":"–"}</div>
+                <div style={{fontWeight:700, fontSize:11}}>GENERAL MEAN</div>
+              </div>
+              <div style={statBox}>
+                <div style={{fontWeight:900, fontSize:22}}>{boysPassRate}%</div>
+                <div style={{fontWeight:700, fontSize:11}}>BOYS PASS RATE</div>
+              </div>
+              <div style={statBox}>
+                <div style={{fontWeight:900, fontSize:22}}>{girlsPassRate}%</div>
+                <div style={{fontWeight:700, fontSize:11}}>GIRLS PASS RATE</div>
+              </div>
+            </div>
+
             <div style={sectionH}>Grade Distribution by Subject</div>
             <div style={{overflowX:"auto"}}>
               <table style={table}>
@@ -1687,6 +1751,8 @@ ${inner}
                   <tr>
                     <th style={{...th,textAlign:"left"}}>Subject</th>
                     <th style={th}>Mean%</th>
+                    <th style={th}>Boys Mean</th>
+                    <th style={th}>Girls Mean</th>
                     <th style={th}>EE</th>
                     <th style={th}>ME</th>
                     <th style={th}>AE</th>
@@ -1697,13 +1763,37 @@ ${inner}
                 <tbody>
                   {SUBJECTS.map(s=>(
                     <tr key={s}>
-                      <td style={{...td,textAlign:"left",fontWeight:700}}>{s}</td>
+                      <td style={{...td,textAlign:"left",fontWeight:700}}>{s} <span style={{fontWeight:400,color:"#888"}}>({subjectKey(s)})</span></td>
                       <td style={td}>{means[s]}</td>
+                      <td style={td}>{means[s+"_M"]}</td>
+                      <td style={td}>{means[s+"_F"]}</td>
                       <td style={td}>{subjectDist[s].counts.EE}</td>
                       <td style={td}>{subjectDist[s].counts.ME}</td>
                       <td style={td}>{subjectDist[s].counts.AE}</td>
                       <td style={td}>{subjectDist[s].counts.BE}</td>
                       <td style={td}>{subjectDist[s].n}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={sectionH}>Subject Champions (Top Scorer per Subject)</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={table}>
+                <thead>
+                  <tr>
+                    <th style={{...th,textAlign:"left"}}>Subject</th>
+                    <th style={{...th,textAlign:"left"}}>Champion</th>
+                    <th style={th}>Score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {SUBJECTS.map(s=>(
+                    <tr key={s}>
+                      <td style={{...td,textAlign:"left",fontWeight:700}}>{s} <span style={{fontWeight:400,color:"#888"}}>({subjectKey(s)})</span></td>
+                      <td style={{...td,textAlign:"left"}}>{champions[s]?champions[s].name:"–"}</td>
+                      <td style={td}>{champions[s]?champions[s].score:"–"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1780,6 +1870,7 @@ function PrintableClassList({ learners, grade, stream, term, year, classTeacher,
             <th style={{...CL.th,width:24}}>#</th>
             <th style={{...CL.th,width:70}}>ASSM. NO.</th>
             <th style={{...CL.th,textAlign:"left",minWidth:130}}>LEARNER NAME</th>
+            <th style={{...CL.th,width:30}}>SEX</th>
             {SUBJECTS.map(s=><th key={s} style={CL.th}>{s}</th>)}
             {hasScores && <>
               <th style={CL.th}>TOTAL</th>
@@ -1799,6 +1890,7 @@ function PrintableClassList({ learners, grade, stream, term, year, classTeacher,
                 <td style={CL.tdC}>{i+1}</td>
                 <td style={CL.tdC}>{l.admNo||"–"}</td>
                 <td style={CL.td}>{l.name}</td>
+                <td style={CL.tdC}>{l.gender||"–"}</td>
                 {SUBJECTS.map(sub=>{
                   const tot = subjectTotal(l.scores, sub);
                   const g = hasScores?getGrade(tot):null;
@@ -1824,7 +1916,7 @@ function PrintableClassList({ learners, grade, stream, term, year, classTeacher,
           })}
           {hasScores && filledCount>0 && (
             <tr style={{background:"#e8e8e8",fontWeight:700,borderTop:"2px solid #000"}}>
-              <td style={CL.tdC} colSpan={2}>CLASS MEAN</td>
+              <td style={CL.tdC} colSpan={4}>CLASS MEAN ({means["_boysCount"]||0} boys, {means["_girlsCount"]||0} girls)</td>
               {SUBJECTS.map(sub=>(
                 <td key={sub} style={{...CL.tdC,fontWeight:700}}>
                   {means[sub]}{means[sub]!=="–"&&<div style={{fontSize:7}}>{getGrade(means[sub])?.sub||""}</div>}
@@ -1835,8 +1927,25 @@ function PrintableClassList({ learners, grade, stream, term, year, classTeacher,
               </td>
             </tr>
           )}
+          {hasScores && filledCount>0 && means["_boysCount"]>0 && (
+            <tr style={{background:"#eef4fb",fontWeight:600,fontSize:10.5}}>
+              <td style={CL.tdC} colSpan={4}>BOYS MEAN</td>
+              {SUBJECTS.map(sub=><td key={sub} style={CL.tdC}>{means[sub+"_M"]}</td>)}
+              <td colSpan={overallTotal>0?6:5} style={CL.tdC}>Boys Avg: <b>{means["_boysMean"]!=="–"?means["_boysMean"]+"%":"–"}</b></td>
+            </tr>
+          )}
+          {hasScores && filledCount>0 && means["_girlsCount"]>0 && (
+            <tr style={{background:"#fdeef3",fontWeight:600,fontSize:10.5}}>
+              <td style={CL.tdC} colSpan={4}>GIRLS MEAN</td>
+              {SUBJECTS.map(sub=><td key={sub} style={CL.tdC}>{means[sub+"_F"]}</td>)}
+              <td colSpan={overallTotal>0?6:5} style={CL.tdC}>Girls Avg: <b>{means["_girlsMean"]!=="–"?means["_girlsMean"]+"%":"–"}</b></td>
+            </tr>
+          )}
         </tbody>
       </table>
+      <div style={{fontSize:8.5,color:"#555",marginTop:4,lineHeight:1.5}}>
+        <b>Key:</b> {SUBJECTS.map(s=>`${s} = ${subjectKey(s)}`).join("  ·  ")}
+      </div>
       <div style={CL.footer}>{schoolName||"Your School Name"} · {term} {year} · {label} · {new Date().toLocaleDateString()}</div>
     </div>
   );
@@ -1862,6 +1971,7 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
       <div style={RC.infoRow}>
         <div style={RC.infoBlock}><span style={RC.infoLabel}>ASSESSMENT NO:</span><span style={RC.infoVal}>{learner.admNo||"—"}</span></div>
         <div style={RC.infoBlock}><span style={RC.infoLabel}>LEARNER:</span><span style={RC.infoVal}>{learner.name}</span></div>
+        {learner.gender && <div style={RC.infoBlock}><span style={RC.infoLabel}>GENDER:</span><span style={RC.infoVal}>{learner.gender==="M"?"Boy":"Girl"}</span></div>}
         <div style={RC.infoBlock}><span style={RC.infoLabel}>CLASS:</span><span style={RC.infoVal}>{label}</span></div>
         <div style={RC.infoBlock}><span style={RC.infoLabel}>TERM:</span><span style={RC.infoVal}>{term}</span></div>
         {classTeacher&&<div style={RC.infoBlock}><span style={RC.infoLabel}>CLASS TEACHER:</span><span style={RC.infoVal}>{classTeacher}</span></div>}
@@ -1885,7 +1995,7 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
             const sRank = subjectRanks && subjectRanks[sub] ? subjectRanks[sub] : "–";
             return (
               <tr key={sub} style={{background:i%2===0?"#fff":"#f5f5f5"}}>
-                <td style={RC.td}><b>{sub}</b></td>
+                <td style={RC.td}><b>{subjectKey(sub)}</b></td>
                 <td style={{...RC.tdC,fontWeight:800,fontSize:14}}>{tot!==""?tot:"–"}</td>
                 <td style={RC.tdC}>{g?<span style={RC.codeBadge}>{g.sub}</span>:"–"}</td>
                 <td style={{...RC.tdC,fontWeight:700}}>{g?.points||"–"}</td>
@@ -1999,6 +2109,7 @@ function ScoreEntryModal({ learner, grade, splitMode, classOptions, onSave, onCl
   const [scores, setScores] = useState({...blankScores(),...learner.scores});
   const [name, setName] = useState(learner.name);
   const [admNo, setAdmNo] = useState(learner.admNo || "");
+  const [gender, setGender] = useState(learner.gender || "");
   const opts = (classOptions && classOptions.length ? classOptions : [""]);
   const [streamSel, setStreamSel] = useState(learner.stream || opts[0] || "");
   return (
@@ -2014,6 +2125,14 @@ function ScoreEntryModal({ learner, grade, splitMode, classOptions, onSave, onCl
             <div style={{...M.field,flex:2,minWidth:180}}>
               <label style={M.label}>Full Name</label>
               <input style={M.input} value={name} onChange={e=>setName(e.target.value.toUpperCase())} />
+            </div>
+            <div style={{...M.field,flex:1,minWidth:110}}>
+              <label style={M.label}>Gender</label>
+              <select style={M.input} value={gender} onChange={e=>setGender(e.target.value)}>
+                <option value="">–</option>
+                <option value="M">Boy</option>
+                <option value="F">Girl</option>
+              </select>
             </div>
             {splitMode && (
               <div style={{...M.field,flex:1,minWidth:120}}>
@@ -2044,7 +2163,7 @@ function ScoreEntryModal({ learner, grade, splitMode, classOptions, onSave, onCl
         </div>
         <div style={{...M.actions,padding:"14px 20px",margin:0,borderTop:"1px solid #eee",background:"#fff"}}>
           <button style={M.cancel} onClick={onClose}>Cancel</button>
-          <button style={M.save} onClick={()=>onSave({name:name.trim()||learner.name, admNo:admNo.trim(), scores, stream:streamSel})}>Save</button>
+          <button style={M.save} onClick={()=>onSave({name:name.trim()||learner.name, admNo:admNo.trim(), gender, scores, stream:streamSel})}>Save</button>
         </div>
       </div>
     </div>
@@ -2054,6 +2173,7 @@ function ScoreEntryModal({ learner, grade, splitMode, classOptions, onSave, onCl
 function AddLearnerModal({ grade, splitMode, defaultStream, classOptions, onAdd, onClose }) {
   const [name, setName] = useState("");
   const [admNo, setAdmNo] = useState("");
+  const [gender, setGender] = useState("");
   const opts = (classOptions && classOptions.length ? classOptions : [""]);
   const [streamSel, setStreamSel] = useState(defaultStream || opts[0] || "");
   return (
@@ -2068,6 +2188,14 @@ function AddLearnerModal({ grade, splitMode, defaultStream, classOptions, onAdd,
           <label style={M.label}>Full Name</label>
           <input style={M.input} value={name} onChange={e=>setName(e.target.value.toUpperCase())} placeholder="e.g. JANE WANJIKU"/>
         </div>
+        <div style={M.field}>
+          <label style={M.label}>Gender</label>
+          <select style={M.input} value={gender} onChange={e=>setGender(e.target.value)}>
+            <option value="">–</option>
+            <option value="M">Boy</option>
+            <option value="F">Girl</option>
+          </select>
+        </div>
         {splitMode && (
           <div style={M.field}>
             <label style={M.label}>Class</label>
@@ -2078,7 +2206,7 @@ function AddLearnerModal({ grade, splitMode, defaultStream, classOptions, onAdd,
         )}
         <div style={M.actions}>
           <button style={M.cancel} onClick={onClose}>Cancel</button>
-          <button style={M.save} onClick={()=>{if(name.trim())onAdd(name.trim(),streamSel,admNo.trim());}}>Add Learner</button>
+          <button style={M.save} onClick={()=>{if(name.trim())onAdd(name.trim(),streamSel,admNo.trim(),gender);}}>Add Learner</button>
         </div>
       </div>
     </div>
@@ -2659,7 +2787,7 @@ function App() {
     const split = isSplitGrade(grade);
     const oldStream = learner.stream || stream;
     const newStream = split ? (payload.stream || oldStream) : "";
-    const updated = { name: payload.name, admNo: payload.admNo||"", scores: payload.scores };
+    const updated = { name: payload.name, admNo: payload.admNo||"", gender: payload.gender||"", scores: payload.scores };
 
     if (split && newStream !== oldStream) {
       // Move learner from old stream's list to the new one
@@ -2676,12 +2804,12 @@ function App() {
     setDirty(true);
   }
 
-  function handleAddLearner(name, streamSel, admNo) {
+  function handleAddLearner(name, streamSel, admNo, gender) {
     const split = isSplitGrade(grade);
     const targetStream = split ? (streamSel || stream) : "";
     const lrns = getLearnersByStream(targetStream);
     if (lrns.find(l=>l.name===name)){setShowAddLearner(false);return;}
-    setLearnersByStream(targetStream, [...lrns,{name,admNo:admNo||"",scores:blankScores()}]);
+    setLearnersByStream(targetStream, [...lrns,{name,admNo:admNo||"",gender:gender||"",scores:blankScores()}]);
     setShowAddLearner(false);
     setDirty(true);
   }
@@ -3391,6 +3519,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
                 {viewMode==="combined" && <th style={S.th}>Stream</th>}
                 <th style={{...S.th,textAlign:"left",minWidth:80}}>Assm. No.</th>
                 <th style={{...S.th,textAlign:"left",minWidth:140}}>Name</th>
+                <th style={S.th}>Sex</th>
                 {SUBJECTS.map(s=><th key={s} style={S.th}>{s}</th>)}
                 <th style={S.th}>Total</th>
                 <th style={S.th}>Avg</th>
@@ -3417,6 +3546,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
                     )}
                     <td style={{...S.tdC,borderRight:"1px solid #e0e0e0",fontSize:11}}>{l.admNo||"–"}</td>
                     <td style={{...S.td,fontWeight:700,borderRight:"1px solid #e0e0e0"}}>{l.name}</td>
+                    <td style={{...S.tdC,borderRight:"1px solid #e0e0e0",fontSize:11}}>{l.gender||"–"}</td>
                     {SUBJECTS.map(sub=>{
                       const tot = subjectTotal(l.scores, sub);
                       const g=getGrade(tot);
@@ -3440,23 +3570,43 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
                   </tr>
                 );
               })}
-              {/* MEANS ROW */}
-              {hasScores && (
+              {/* MEANS ROWS */}
+              {hasScores && (()=>{
+                const metaSpan = 4 + (split?1:0) + (viewMode==="combined"?1:0); // Class Rank[+Gr.Rank][+Stream]+Assm.No+Name+Sex
+                return <>
                 <tr style={{background:"#e8e8e8",borderTop:"2px solid #000",fontWeight:700}}>
-                  <td style={S.tdC} colSpan={split?(viewMode==="combined"?4:3):2}>CLASS MEAN</td>
+                  <td style={S.tdC} colSpan={metaSpan}>CLASS MEAN ({means["_boysCount"]||0}B / {means["_girlsCount"]||0}G)</td>
                   {SUBJECTS.map(sub=>(
                     <td key={sub} style={{...S.tdC,fontSize:11}}>
                       <div style={{fontWeight:700}}>{means[sub]}</div>
                       {means[sub]!=="–"&&<div style={{fontSize:8,color:"#444"}}>{getGrade(means[sub])?.sub||""}</div>}
                     </td>
                   ))}
-                  <td colSpan={6} style={{...S.tdC,fontSize:11}}>
+                  <td colSpan={5} style={{...S.tdC,fontSize:11}}>
                     Class Mean: <b>{means["_meanTotal"]}/{means["_maxTotal"]}</b> &nbsp;(Avg: <b>{means["_classMean"]!=="–"?means["_classMean"]+"%":"–"}</b>)
                   </td>
                 </tr>
-              )}
+                {means["_boysCount"]>0 && (
+                  <tr style={{background:"#eef4fb",fontWeight:600}}>
+                    <td style={S.tdC} colSpan={metaSpan}>BOYS MEAN</td>
+                    {SUBJECTS.map(sub=><td key={sub} style={{...S.tdC,fontSize:11}}>{means[sub+"_M"]}</td>)}
+                    <td colSpan={5} style={{...S.tdC,fontSize:11}}>Boys Avg: <b>{means["_boysMean"]!=="–"?means["_boysMean"]+"%":"–"}</b></td>
+                  </tr>
+                )}
+                {means["_girlsCount"]>0 && (
+                  <tr style={{background:"#fdeef3",fontWeight:600}}>
+                    <td style={S.tdC} colSpan={metaSpan}>GIRLS MEAN</td>
+                    {SUBJECTS.map(sub=><td key={sub} style={{...S.tdC,fontSize:11}}>{means[sub+"_F"]}</td>)}
+                    <td colSpan={5} style={{...S.tdC,fontSize:11}}>Girls Avg: <b>{means["_girlsMean"]!=="–"?means["_girlsMean"]+"%":"–"}</b></td>
+                  </tr>
+                )}
+                </>;
+              })()}
             </tbody>
           </table>
+        </div>
+        <div style={{fontSize:10.5,color:"#666",margin:"6px 2px 0",lineHeight:1.6}} className="no-print">
+          <b>Key:</b> {SUBJECTS.map(s=>`${s} = ${subjectKey(s)}`).join("  ·  ")}
         </div>
 
         {/* ── ALWAYS-RENDERED DOWNLOAD SOURCE (hidden) ──────────────────────
