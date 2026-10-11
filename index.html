@@ -457,6 +457,20 @@ async function saveSubjectScores(key, subject, updatesByName, rosterNames, retri
   }
   return false;
 }
+// A grade that has named classes (East, West…) must not also carry the blank "Main" class.
+// The blank one is dropped only when it has no learners, so no real data is ever hidden.
+async function cleanClassesConfig(cfg) {
+  const base = { ...(cfg || {}) };
+  ["7","8","9"].forEach(g => { if (!base[g] || !base[g].length) base[g] = [""]; });
+  for (const g of Object.keys(base)) {
+    const list = base[g];
+    if (list.includes("") && list.some(x => x !== "")) {
+      const roster = (await loadShared(learnersKey(g, ""), [])) || [];
+      if (!roster.length) base[g] = list.filter(x => x !== "");
+    }
+  }
+  return base;
+}
 async function listSharedKeys(prefix) {
   const db = await loadDB();
   return Object.keys(db).filter(k => k.startsWith(prefix));
@@ -830,14 +844,19 @@ function ManageClassesScreen({ classesConfig, onSave, onDone }) {
   const btn = (bg) => ({ padding: "10px 14px", background: bg, color: "#fff",
     border: "none", borderRadius: 8, fontSize: 14, fontWeight: 700, cursor: "pointer" });
 
-  function addClass(grade) {
+  async function addClass(grade) {
     const raw = (newNames[grade] || "").trim();
     if (!raw) return;
     const list = cfg[grade] || [];
     if (list.includes(raw)) { alert(`Grade ${grade} already has a class named "${raw}".`); return; }
-    // If the only existing class is the blank/default "Main" one and it's empty of meaning,
-    // just add alongside it — admin can remove "Main" afterward once learners are reassigned.
-    setCfg(c => ({ ...c, [grade]: [...list, raw] }));
+    // If the only existing class is the blank/default "Main" one and it has no learners,
+    // replace it — otherwise a useless empty "Main" class would sit beside East/West.
+    let next = [...list, raw];
+    if (list.length === 1 && list[0] === "") {
+      const roster = (await loadShared(learnersKey(grade, ""), [])) || [];
+      if (!roster.length) next = [raw];
+    }
+    setCfg(c => ({ ...c, [grade]: next }));
     setNewNames(n => ({ ...n, [grade]: "" }));
   }
 
@@ -2365,7 +2384,7 @@ function App() {
   useEffect(()=>{
     (async()=>{
       const cfg = await loadShared("sision_classes_config", null);
-      setClassesConfig(normalizeClassesConfig(cfg));
+      setClassesConfig(await cleanClassesConfig(normalizeClassesConfig(cfg)));
       setClassesConfigLoaded(true);
       const sc = await loadShared("sision_school_config", null);
       if (sc) {
@@ -2412,6 +2431,21 @@ function App() {
   const [subjectYear, setSubjectYear]       = useState(()=>localStorage.getItem("sision_last_year")||"2026");
   const [subjectList, setSubjectList]       = useState([]); // [{name, score}]
   const [subjectLoading, setSubjectLoading] = useState(false);
+  // Marks typed but not yet uploaded. While true, nothing may reload/overwrite the list.
+  const [subjectDirty, setSubjectDirty]     = useState(false);
+  const subjectDirtyRef  = useRef(false);
+  const subjectLoadSeq   = useRef(0);
+  const subjectListKeyRef = useRef("");
+  function markSubjectDirty(v) { subjectDirtyRef.current = v; setSubjectDirty(v); }
+  // Ask before a Term / Year / Subject change throws away typed-but-unuploaded marks.
+  function okToLeaveSubjectList() {
+    if (!subjectDirtyRef.current) return true;
+    if (confirm("You have marks typed that are NOT uploaded yet.\n\nChanging this will erase them.\n\nTap Cancel, then press ⬆ Upload first.\n\nErase and continue?")) {
+      markSubjectDirty(false);
+      return true;
+    }
+    return false;
+  }
 
   // A returning subject-teacher session (e.g. after a page reload) restores
   // userSession from localStorage but not subjectSession — rebuild it here.
@@ -2453,6 +2487,8 @@ function App() {
 
     async function loadSubjectEntryList() {
     if (!subjectSession || !subjectClass || !subjectChoice) return;
+    const seq = ++subjectLoadSeq.current;
+    const listKey = `${subjectClass.grade}|${subjectClass.stream||""}|${subjectChoice}|${subjectTerm}|${subjectYear}`;
     setSubjectLoading(true);
     setSubjectNotConnected(false);
     try {
@@ -2466,11 +2502,40 @@ function App() {
       });
       const list = roster.map(l => ({ name: l.name, admNo: l.admNo||"", score: scoreMap[l.name] ?? "" }));
       list.sort((a,b)=>a.name.localeCompare(b.name));
+      // A newer load superseded this one — drop this result.
+      if (seq !== subjectLoadSeq.current) return;
+      // Same class/subject/term already on screen with unsaved typing: keep the typing.
+      if (subjectDirtyRef.current && subjectListKeyRef.current === listKey) return;
+      subjectListKeyRef.current = listKey;
+      markSubjectDirty(false);
       setSubjectList(list);
     } finally {
-      setSubjectLoading(false);
+      if (seq === subjectLoadSeq.current) setSubjectLoading(false);
     }
   }
+
+  // Map a teacher's assigned classes onto the classes that really exist. An old
+  // assignment to the blank "Main" class becomes East/West (whichever exist).
+  function resolveSubjectClasses(list) {
+    const out = [], seen = new Set();
+    (list || []).forEach(c => {
+      const streams = classesConfig[c.grade] || [""];
+      const st = c.stream || "";
+      const targets = streams.includes(st) ? [st] : (st === "" ? streams : []);
+      targets.forEach(x => { const k = c.grade + "|" + x; if (!seen.has(k)) { seen.add(k); out.push({ grade: c.grade, stream: x }); } });
+    });
+    return out;
+  }
+  useEffect(() => {
+    if (!classesConfigLoaded || !subjectSession || !subjectClass) return;
+    const streams = classesConfig[subjectClass.grade] || [""];
+    if (!streams.includes(subjectClass.stream || "")) {
+      const r = resolveSubjectClasses(subjectSession.classes);
+      if (r.length === 1) setSubjectClass(r[0]);
+      else { setSubjectClass(null); setPage("subjectClassPick"); }
+    }
+    // eslint-disable-next-line
+  }, [classesConfigLoaded, classesConfig, subjectSession, subjectClass]);
 
   async function uploadSubjectScores() {
     if (!subjectSession || !subjectClass || !subjectChoice) return;
@@ -2483,6 +2548,7 @@ function App() {
       const key = storageKey(subjectClass.grade, subjectClass.stream, subjectTerm, subjectYear);
       const ok = await saveSubjectScores(key, subjectChoice, updates, rosterNames);
       if (ok) {
+        markSubjectDirty(false);
         setSubjectSaved(true);
         setTimeout(()=>setSubjectSaved(false), 2500);
       } else {
@@ -2497,7 +2563,7 @@ function App() {
     if (page === "subjectEntry") loadSubjectEntryList();
     // eslint-disable-next-line
 
-  }, [page, subjectClass, subjectChoice, subjectTerm, subjectYear]);
+  }, [page, subjectClass && subjectClass.grade, subjectClass && subjectClass.stream, subjectChoice, subjectTerm, subjectYear]);
   const [saving, setSaving]                 = useState(false);
   const [dirty, setDirty]                   = useState(false);
   // "rank" = sorted by performance, "name" = alphabetical (handy for entering marks)
@@ -3138,7 +3204,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
         onDone={async()=>{
           setShowWizard(false);
           const cfg = await loadShared("sision_classes_config", null);
-          setClassesConfig(normalizeClassesConfig(cfg));
+          setClassesConfig(await cleanClassesConfig(normalizeClassesConfig(cfg)));
         }}
         onSkip={()=>setShowWizard(false)}
       />}
@@ -3259,8 +3325,8 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
         <div style={S.homeCard}>
           <h2 style={S.cardTitle}>Which class are you entering marks for?</h2>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
-            {subjectSession.classes.map((c,i)=>(
-              <button key={i} style={S.btn} onClick={()=>{ setSubjectClass(c); proceedAfterClass(subjectSession, c); }}>
+            {resolveSubjectClasses(subjectSession.classes).map((c,i)=>(
+              <button key={i} style={S.btn} onClick={()=>{ markSubjectDirty(false); setSubjectClass(c); proceedAfterClass(subjectSession, c); }}>
                 Grade {c.grade}{c.stream?` ${c.stream}`:""}
               </button>
             ))}
@@ -3311,19 +3377,19 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
           <div style={S.topTitle}>{subjectSession.name} · {subjectChoice} · {clsLabel}</div>
           <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
             {subjectSession.subjects.length > 1 && (
-              <select style={S.select} value={subjectChoice} onChange={e=>setSubjectChoice(e.target.value)}>
+              <select style={S.select} value={subjectChoice} onChange={e=>{ if(!okToLeaveSubjectList()) return; setSubjectChoice(e.target.value); }}>
                 {subjectSession.subjects.map(s=><option key={s} value={s}>{s}</option>)}
               </select>
             )}
-            <select style={S.select} value={subjectTerm} onChange={e=>setSubjectTerm(e.target.value)}>
+            <select style={S.select} value={subjectTerm} onChange={e=>{ if(!okToLeaveSubjectList()) return; setSubjectTerm(e.target.value); }}>
               {termsFor(subjectClass.grade).map(t=><option key={t} value={t}>{t}</option>)}
             </select>
-            <select style={S.select} value={subjectYear} onChange={e=>setSubjectYear(e.target.value)}>
+            <select style={S.select} value={subjectYear} onChange={e=>{ if(!okToLeaveSubjectList()) return; setSubjectYear(e.target.value); }}>
               {YEARS.map(y=><option key={y} value={y}>{y}</option>)}
             </select>
             <button style={{...S.ghostBtn,...(subjectSaved?{background:"#e8f5e9",color:"#2e7d32",borderColor:"#2e7d32"}:{})}}
               onClick={uploadSubjectScores} disabled={subjectSaving || subjectLoading || subjectNotConnected}>
-              {subjectSaving?"Uploading…":(subjectSaved?"✓ Uploaded!":"⬆ Upload")}
+              {subjectSaving?"Uploading…":(subjectSaved?"✓ Uploaded!":(subjectDirty?"⬆ Upload (unsaved)":"⬆ Upload"))}
             </button>
           </div>
         </div>
@@ -3365,6 +3431,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
                           onChange={e=>{
                             let v = e.target.value;
                             if (v!=="" && !isNaN(v)) { v = Math.max(0, Math.min(100, Number(v))); }
+                            markSubjectDirty(true);
                             setSubjectList(list => list.map((r,idx)=> idx===i ? {...r, score:v} : r));
                           }} />
                       </td>
@@ -3377,7 +3444,7 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
             <div style={{marginTop:16}}>
               <button style={{...S.ghostBtn,...(subjectSaved?{background:"#e8f5e9",color:"#2e7d32",borderColor:"#2e7d32"}:{})}}
                 onClick={uploadSubjectScores} disabled={subjectSaving || subjectLoading}>
-                {subjectSaving?"Uploading…":(subjectSaved?"✓ Uploaded!":"⬆ Upload")}
+                {subjectSaving?"Uploading…":(subjectSaved?"✓ Uploaded!":(subjectDirty?"⬆ Upload (unsaved)":"⬆ Upload"))}
               </button>
             </div>
           </div>
