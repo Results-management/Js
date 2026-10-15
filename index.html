@@ -17,7 +17,8 @@
 <style>
   html,body,#root{margin:0;padding:0;background:#f4f4f4;}
   *{box-sizing:border-box;}
-  .report-card{page-break-inside:avoid;}
+  .report-card{page-break-inside:avoid;break-inside:avoid;}
+  .report-card + .report-card{page-break-before:always;break-before:page;}
 </style>
 <script>
 /**
@@ -373,39 +374,91 @@ function dbUrl() {
   return `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/db.json`;
 }
 
-async function loadDB(force) {
-  if (DB_CACHE && !force) return DB_CACHE;
-  if (!GH) return {};
-  try {
-    const res = await fetch(dbUrl(), { headers: ghH() });
-    if (res.status === 404) { DB_CACHE = {}; DB_SHA = null; return {}; }
-    if (!res.ok) return DB_CACHE || {};
-    const j = await res.json();
-    DB_SHA = j.sha;
-    DB_CACHE = JSON.parse(decodeURIComponent(escape(atob(j.content.replace(/\n/g, "")))));
-    return DB_CACHE;
-  } catch { return DB_CACHE || {}; }
+let DB_CACHE_AT = 0;
+let DB_INFLIGHT = null;
+const GH_BRANCH = "main";
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function cellStr(v) { return (v === undefined || v === null) ? "" : String(v); }
+
+// Decide one mark when saving, so a stale screen can NEVER wipe someone else's marks.
+//  local  = value on this screen now
+//  base   = value this screen had when it was loaded / last saved
+//  remote = value that is in the live database right now
+function decideCell(local, base, remote) {
+  const l = cellStr(local), r = cellStr(remote);
+  if (base === undefined) return l !== "" ? local : (remote === undefined ? "" : remote);
+  if (l !== cellStr(base)) return local === undefined ? "" : local;   // user edited this cell
+  if (r === "" && l !== "") return local;                             // database lost it: put it back
+  return remote === undefined ? local : remote;                       // unchanged here: keep the newer value
 }
 
-async function saveDB(db, retries) {
+// Read the live db.json. THROWS on any problem, so we never save on top of a blank or partial copy.
+async function fetchRemoteDB(ref) {
+  if (!GH) throw new Error("not connected");
+  const url = dbUrl() + "?t=" + Date.now() + (ref ? "&ref=" + encodeURIComponent(ref) : "");
+  const res = await fetch(url, { headers: ghH(), cache: "no-store" });
+  if (res.status === 404) return { db: {}, sha: null };
+  if (!res.ok) throw new Error("GitHub " + res.status);
+  const j = await res.json();
+  let text;
+  if (j.content && j.encoding === "base64") {
+    text = decodeURIComponent(escape(atob(j.content.replace(/\n/g, ""))));
+  } else {
+    // files over 1MB come back without content: fetch the raw file instead
+    const raw = await fetch(url, { headers: { ...ghH(), Accept: "application/vnd.github.v3.raw" }, cache: "no-store" });
+    if (!raw.ok) throw new Error("GitHub raw " + raw.status);
+    text = await raw.text();
+  }
+  const db = JSON.parse(text);
+  if (!db || typeof db !== "object" || Array.isArray(db)) throw new Error("bad db");
+  return { db, sha: j.sha };
+}
+
+async function loadDB(force) {
+  if (!GH) return {};
+  if (DB_CACHE && !force && (Date.now() - DB_CACHE_AT) < 30000) return DB_CACHE;
+  // share one download between callers that ask at the same moment (e.g. the trend graph)
+  if (DB_INFLIGHT) return DB_INFLIGHT;
+  DB_INFLIGHT = (async () => {
+    try {
+      const r = await fetchRemoteDB();
+      DB_CACHE = r.db; DB_SHA = r.sha; DB_CACHE_AT = Date.now();
+      return DB_CACHE;
+    } catch { return DB_CACHE || {}; }
+    finally { DB_INFLIGHT = null; }
+  })();
+  return DB_INFLIGHT;
+}
+
+// The ONLY way data is written. Every write: (1) downloads the newest db.json,
+// (2) applies a small change to just the keys it owns, (3) uploads with the sha it just read.
+// If anyone else saved in between, GitHub rejects it and we redo steps 1-3 on the new copy.
+// A stale copy of the whole database is never uploaded.
+async function mutateDB(mutator, retries, message) {
   if (!GH) return false;
-  retries = retries === undefined ? 2 : retries;
-  try {
-    const content = btoa(unescape(encodeURIComponent(JSON.stringify(db))));
-    const body = { message: "Update marks", content, branch: "main" };
-    if (DB_SHA) body.sha = DB_SHA;
-    const res = await fetch(dbUrl(), { method: "PUT", headers: ghH(), body: JSON.stringify(body) });
-    if (res.status === 409 && retries > 0) {
-      await loadDB(true);
-      Object.assign(DB_CACHE, db);
-      return await saveDB(DB_CACHE, retries - 1);
-    }
-    if (!res.ok) return false;
-    const j = await res.json();
-    DB_SHA = j.content.sha;
-    DB_CACHE = db;
-    return true;
-  } catch { return false; }
+  retries = retries === undefined ? 6 : retries;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let remote;
+    try { remote = await fetchRemoteDB(); }
+    catch { await sleep(400 * (attempt + 1)); continue; }
+    const db = remote.db;
+    const changed = mutator(db);
+    if (changed === false) { DB_CACHE = db; DB_SHA = remote.sha; DB_CACHE_AT = Date.now(); return true; }
+    try {
+      const content = btoa(unescape(encodeURIComponent(JSON.stringify(db))));
+      const body = { message: message || "Update marks", content, branch: GH_BRANCH };
+      if (remote.sha) body.sha = remote.sha;
+      const res = await fetch(dbUrl(), { method: "PUT", headers: ghH(), body: JSON.stringify(body) });
+      if (res.ok) {
+        const j = await res.json();
+        DB_CACHE = db; DB_SHA = j.content.sha; DB_CACHE_AT = Date.now();
+        return true;
+      }
+      if (res.status === 409 || res.status === 422) { await sleep(300 + Math.random() * 600); continue; }
+      return false;
+    } catch { await sleep(400 * (attempt + 1)); }
+  }
+  return false;
 }
 
 async function loadShared(key, fb) {
@@ -413,10 +466,7 @@ async function loadShared(key, fb) {
   return (db[key] !== undefined && db[key] !== null) ? db[key] : fb;
 }
 async function saveShared(key, data) {
-  const db = await loadDB();
-  db[key] = data;
-  DB_CACHE = db;
-  return await saveDB(db);
+  return await mutateDB(db => { db[key] = data; }, undefined, "Update " + key);
 }
 
 // A subject-teacher account's "classes" field can be the literal array of
@@ -431,31 +481,22 @@ async function resolveUserClasses(classesField) {
   return classesField || [];
 }
 
-// Safely merge one subject's scores into the shared marks list, by learner name,
-// without touching any other subject's scores. Re-fetches fresh data on every
-// attempt so two subject teachers saving at the same time can never wipe each
-// other's entries — only the specific subject cells being uploaded are changed.
-async function saveSubjectScores(key, subject, updatesByName, rosterNames, retries) {
-  retries = retries === undefined ? 3 : retries;
-  if (!GH) return false;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    await loadDB(true);
-    const db = DB_CACHE || {};
-    let arr = db[key];
-    if (!arr || !arr.length) {
-      arr = (rosterNames || []).map(n => ({ name: n, scores: blankScores() }));
-    }
-    arr = arr.map(l => {
-      if (Object.prototype.hasOwnProperty.call(updatesByName, l.name)) {
-        return { ...l, scores: { ...(l.scores || blankScores()), [subject]: updatesByName[l.name] } };
-      }
-      return l;
+// Save ONE subject's marks for a class. Only that subject's cells are touched, and a cell is
+// only overwritten when the teacher actually changed it (see decideCell). Learners who are on the
+// roster but missing from the marks list are added instead of being silently dropped.
+async function saveSubjectScores(key, subject, updatesByName, rosterNames, baselineByName) {
+  baselineByName = baselineByName || {};
+  return await mutateDB(db => {
+    const arr = Array.isArray(db[key]) ? db[key].slice() : [];
+    const have = new Set(arr.map(l => l.name));
+    (rosterNames || []).forEach(n => { if (!have.has(n)) arr.push({ name: n, admNo: "", scores: blankScores() }); });
+    db[key] = arr.map(l => {
+      if (!Object.prototype.hasOwnProperty.call(updatesByName, l.name)) return l;
+      const scores = { ...blankScores(), ...(l.scores || {}) };
+      scores[subject] = decideCell(updatesByName[l.name], baselineByName[l.name], scores[subject]);
+      return { ...l, scores };
     });
-    db[key] = arr;
-    const ok = await saveDB(db, 0);
-    if (ok) return true;
-  }
-  return false;
+  }, undefined, "Marks upload: " + key + " " + subject);
 }
 // A grade that has named classes (East, West…) must not also carry the blank "Main" class.
 // The blank one is dropped only when it has no learners, so no real data is ever hidden.
@@ -1513,6 +1554,255 @@ function YearAdvancementWizard({ fromYear, toYear, classesConfig, onDone, onSkip
   );
 }
 
+// ─── RESTORE / BACKUP SCREEN ─────────────────────────────────────────────────
+function prettyKey(k) {
+  const m = k.match(/^sision_(scores|comment)_(\d)_(.*)_(\d{4})$/);
+  if (!m) return k;
+  const rest = m[3].split("_");
+  const stream = rest[0] === "none" ? "" : rest[0];
+  return (m[1] === "comment" ? "Comment · " : "") + "Grade " + m[2] + (stream ? " " + stream : "") + " · " + rest.slice(1).join(" ") + " · " + m[4];
+}
+function countMarks(arr, sub) {
+  let n = 0;
+  (arr || []).forEach(l => SUBJECTS.forEach(s => { if ((!sub || s === sub) && cellStr(l.scores && l.scores[s]) !== "") n++; }));
+  return n;
+}
+// fill = marks the backup has where the live database is blank; differ = both have a mark but different
+function diffScores(liveArr, snapArr, sub) {
+  const by = {}; (liveArr || []).forEach(l => { by[l.name] = l; });
+  let fill = 0, differ = 0;
+  (snapArr || []).forEach(sl => {
+    const ll = by[sl.name];
+    SUBJECTS.forEach(s => {
+      if (sub && s !== sub) return;
+      const sv = cellStr(sl.scores && sl.scores[s]); if (sv === "") return;
+      const lv = ll ? cellStr(ll.scores && ll.scores[s]) : "";
+      if (lv === "") fill++; else if (lv !== sv) differ++;
+    });
+  });
+  return { fill, differ };
+}
+function applyRestore(liveArr, snapArr, sub, replace) {
+  const out = (liveArr || []).map(l => ({ ...l, scores: { ...(l.scores || {}) } }));
+  const by = {}; out.forEach(l => { by[l.name] = l; });
+  (snapArr || []).forEach(sl => {
+    let l = by[sl.name];
+    if (!l) { l = { name: sl.name, admNo: sl.admNo || "", gender: sl.gender || "", scores: blankScores() }; out.push(l); by[l.name] = l; }
+    SUBJECTS.forEach(s => {
+      if (sub && s !== sub) return;
+      const sv = sl.scores ? sl.scores[s] : undefined;
+      if (replace) { if (sv !== undefined) l.scores[s] = sv; }
+      else if (cellStr(sv) !== "" && cellStr(l.scores[s]) === "") l.scores[s] = sv;
+    });
+  });
+  return out;
+}
+
+function RestoreScreen({ onDone }) {
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState("");
+  const [versions, setVersions] = useState(null);
+  const [snap, setSnap] = useState(null);
+  const [snapLabel, setSnapLabel] = useState("");
+  const [live, setLive] = useState(null);
+  const [sub, setSub] = useState("");
+  const [mode, setMode] = useState("fill");
+  const [off, setOff] = useState({});
+  const SUB_LABELS = { MATH:"Mathematics", ENG:"English", KISW:"Kiswahili", SCIENCE:"Integrated Science", PRETECH:"Pre-Technical Studies", AGRIC:"Agriculture & Nutrition", SOCIAL:"Social Studies", RE:"Religious Education", "C/A":"Creative Arts" };
+
+  const bx = { maxWidth: 680, margin: "24px auto", background: "#fff", borderRadius: 14, padding: "24px 18px", fontFamily: "-apple-system,sans-serif", boxShadow: "0 2px 20px rgba(0,0,0,0.10)" };
+  const btn = bg => ({ padding: "10px 14px", background: bg, color: "#fff", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 700, cursor: busy ? "default" : "pointer", marginRight: 8, marginBottom: 8, opacity: busy ? 0.6 : 1 });
+  const card = { border: "1px solid #e5e7eb", borderRadius: 10, padding: 14, marginBottom: 14 };
+  const h = { fontSize: 15, fontWeight: 800, marginBottom: 4 };
+  const p = { fontSize: 12.5, color: "#555", margin: "2px 0 10px" };
+  const fmtDate = d => { try { return new Date(d).toLocaleString(); } catch { return d; } };
+
+  async function downloadBackup() {
+    setMsg(""); setBusy("Preparing backup…");
+    try {
+      const r = await fetchRemoteDB();
+      const blob = new Blob([JSON.stringify(r.db, null, 1)], { type: "application/json" });
+      const a = document.createElement("a");
+      const d = new Date(), z = n => String(n).padStart(2, "0");
+      a.href = URL.createObjectURL(blob);
+      a.download = "sision_backup_" + d.getFullYear() + "-" + z(d.getMonth() + 1) + "-" + z(d.getDate()) + "_" + z(d.getHours()) + z(d.getMinutes()) + ".json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setMsg("✅ Backup downloaded. Keep it somewhere safe (e.g. WhatsApp to yourself).");
+    } catch { setMsg("❌ Could not read the database. Check your connection and token."); }
+    setBusy("");
+  }
+
+  async function fetchVersions() {
+    const res = await fetch("https://api.github.com/repos/" + GH.owner + "/" + GH.repo + "/commits?path=db.json&per_page=100&t=" + Date.now(), { headers: ghH(), cache: "no-store" });
+    if (!res.ok) throw new Error("commits " + res.status);
+    const j = await res.json();
+    return j.map(c => ({ sha: c.sha, date: (c.commit && c.commit.committer && c.commit.committer.date) || "", message: (c.commit && c.commit.message) || "" }));
+  }
+  async function loadVersions() {
+    setMsg(""); setBusy("Loading history…");
+    try { setVersions(await fetchVersions()); }
+    catch { setMsg("❌ Could not load history. Check your connection and that the GitHub token can read the repo."); }
+    setBusy("");
+  }
+  async function useVersion(v) {
+    setMsg(""); setBusy("Loading that version…");
+    try {
+      const [s, l] = await Promise.all([fetchRemoteDB(v.sha), fetchRemoteDB()]);
+      setSnap(s.db); setLive(l.db); setSnapLabel("Saved " + fmtDate(v.date)); setOff({});
+    } catch { setMsg("❌ Could not load that version."); }
+    setBusy("");
+  }
+  // Walk back through past saves (newest first) and collect the most recent mark ever stored for every cell.
+  async function scanAll() {
+    setMsg("");
+    try {
+      setBusy("Loading history…");
+      const vs = versions || await fetchVersions();
+      setVersions(vs);
+      const combined = {};
+      const n = Math.min(vs.length, 60);
+      for (let i = 0; i < n; i++) {
+        setBusy("Scanning save " + (i + 1) + " of " + n + "…");
+        try {
+          const r = await fetchRemoteDB(vs[i].sha);
+          Object.keys(r.db).forEach(k => {
+            if (k.startsWith("sision_scores_") && Array.isArray(r.db[k])) combined[k] = applyRestore(combined[k], r.db[k], "", false);
+            else if (k.startsWith("sision_comment_") && typeof r.db[k] === "string" && r.db[k].trim() && !combined[k]) combined[k] = r.db[k];
+          });
+        } catch {}
+      }
+      const l = await fetchRemoteDB();
+      setSnap(combined); setLive(l.db); setSnapLabel("Newest marks found across the last " + n + " saves"); setOff({});
+    } catch { setMsg("❌ Could not scan the history. Check your connection and token."); }
+    setBusy("");
+  }
+  function onFile(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (!GH) { setMsg("❌ Not connected to GitHub."); return; }
+    setMsg(""); setBusy("Reading file…");
+    const rd = new FileReader();
+    rd.onload = async () => {
+      try {
+        const obj = JSON.parse(rd.result);
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("bad");
+        const l = await fetchRemoteDB();
+        setSnap(obj); setLive(l.db); setSnapLabel("File: " + f.name); setOff({});
+      } catch { setMsg("❌ That file is not a valid db.json backup."); }
+      setBusy("");
+    };
+    rd.onerror = () => { setMsg("❌ Could not read the file."); setBusy(""); };
+    rd.readAsText(f);
+    e.target.value = "";
+  }
+
+  const rows = [];
+  if (snap && live) {
+    Object.keys(snap).filter(k => k.startsWith("sision_scores_") && Array.isArray(snap[k])).sort().forEach(k => {
+      const d = diffScores(live[k], snap[k], sub);
+      if (mode === "fill" ? d.fill > 0 : (d.fill + d.differ) > 0)
+        rows.push({ key: k, type: "scores", fill: d.fill, differ: d.differ, liveN: countMarks(live[k], sub), snapN: countMarks(snap[k], sub) });
+    });
+    if (!sub) Object.keys(snap).filter(k => k.startsWith("sision_comment_") && typeof snap[k] === "string" && snap[k].trim()).sort().forEach(k => {
+      const lv = typeof live[k] === "string" ? live[k].trim() : "", sv = snap[k].trim();
+      const fill = lv === "" ? 1 : 0, differ = (lv !== "" && lv !== sv) ? 1 : 0;
+      if (mode === "fill" ? fill > 0 : (fill + differ) > 0) rows.push({ key: k, type: "comment", fill, differ });
+    });
+  }
+  const chosen = rows.filter(r => !off[r.key]);
+
+  async function doRestore() {
+    if (!chosen.length || busy) return;
+    const scope = sub ? " (" + SUB_LABELS[sub] + " only)" : "";
+    const what = mode === "replace" ? "Marks in the live database will be OVERWRITTEN with the old ones." : "Only blank marks will be filled in; nothing that exists now is changed.";
+    if (!window.confirm("Restore " + chosen.length + " item(s)" + scope + " from this version?\n\n" + what)) return;
+    setBusy("Restoring…"); setMsg("");
+    const items = chosen.map(r => ({ key: r.key, type: r.type }));
+    const ok = await mutateDB(db => {
+      items.forEach(it => {
+        if (it.type === "scores") db[it.key] = applyRestore(db[it.key], snap[it.key], sub, mode === "replace");
+        else if (mode === "replace" || !(typeof db[it.key] === "string" && db[it.key].trim())) db[it.key] = snap[it.key];
+      });
+    }, undefined, "Restore from backup");
+    if (ok) {
+      try { const l = await fetchRemoteDB(); setLive(l.db); } catch {}
+      setMsg("✅ Restored. Open the class again to see the marks.");
+    } else setMsg("❌ Restore failed. Nothing was changed. Please try again.");
+    setBusy("");
+  }
+
+  return (
+    <div style={{ background: "#eef2ff", minHeight: "100vh", padding: "16px 12px" }}>
+      <div style={bx}>
+        <div style={{ fontSize: 21, fontWeight: 800, marginBottom: 2 }}>🛟 Backup & Restore</div>
+        <p style={p}>Every save is also kept in your GitHub history, so lost marks can usually be brought back from here.</p>
+        {!GH && <div style={{ color: "#c0392b", fontSize: 13, marginBottom: 12 }}>Not connected to GitHub — connect first.</div>}
+        {busy && <div style={{ background: "#fff7e0", border: "1px solid #f2d27a", borderRadius: 8, padding: "8px 12px", fontSize: 13, marginBottom: 12 }}>⏳ {busy}</div>}
+        {msg && <div style={{ background: "#f3f4f6", borderRadius: 8, padding: "8px 12px", fontSize: 13, marginBottom: 12 }}>{msg}</div>}
+
+        <div style={card}>
+          <div style={h}>1. Back up now</div>
+          <p style={p}>Downloads the whole database (all marks, classes, teachers) as one file.</p>
+          <button style={btn("#16a34a")} disabled={!GH || !!busy} onClick={downloadBackup}>⬇ Download backup</button>
+        </div>
+
+        <div style={card}>
+          <div style={h}>2. Find lost marks</div>
+          <p style={p}>Pick where to bring marks back from:</p>
+          <button style={btn("#1a56db")} disabled={!GH || !!busy} onClick={scanAll}>🔎 Scan all past saves (recommended)</button>
+          <button style={btn("#555")} disabled={!GH || !!busy} onClick={loadVersions}>🕑 Choose one saved version</button>
+          <button style={btn("#555")} disabled={!GH || !!busy} onClick={() => { const el = document.getElementById("restore-file"); if (el) el.click(); }}>📂 From a backup file</button>
+          <input id="restore-file" type="file" accept=".json,application/json" style={{ display: "none" }} onChange={onFile} />
+          {versions && !snap && (
+            <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #eee", borderRadius: 8, marginTop: 6 }}>
+              {versions.length === 0 && <div style={{ padding: 10, fontSize: 13 }}>No saved versions found.</div>}
+              {versions.map(v => (
+                <div key={v.sha} onClick={() => !busy && useVersion(v)} style={{ padding: "8px 10px", borderBottom: "1px solid #f0f0f0", fontSize: 13, cursor: "pointer" }}>
+                  <b>{fmtDate(v.date)}</b><span style={{ color: "#777" }}> — {v.message.split("\n")[0]}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {snap && live && (
+          <div style={card}>
+            <div style={h}>3. Restore</div>
+            <p style={p}>Source: <b>{snapLabel}</b></p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 10, fontSize: 13 }}>
+              <label>Subject:{" "}
+                <select value={sub} onChange={e => { setSub(e.target.value); setOff({}); }} style={{ padding: 6, borderRadius: 6 }}>
+                  <option value="">All subjects</option>
+                  {SUBJECTS.map(s => <option key={s} value={s}>{SUB_LABELS[s] || s}</option>)}
+                </select>
+              </label>
+            </div>
+            <div style={{ fontSize: 13, marginBottom: 10 }}>
+              <label style={{ display: "block", marginBottom: 4 }}><input type="radio" checked={mode === "fill"} onChange={() => { setMode("fill"); setOff({}); }} /> Fill missing marks only <span style={{ color: "#16a34a" }}>(safe — recommended)</span></label>
+              <label style={{ display: "block" }}><input type="radio" checked={mode === "replace"} onChange={() => { setMode("replace"); setOff({}); }} /> Overwrite with the old marks <span style={{ color: "#c0392b" }}>(replaces what is there now)</span></label>
+            </div>
+            {rows.length === 0 && <div style={{ fontSize: 13, color: "#555", padding: "8px 0" }}>Nothing to restore here{sub ? " for " + SUB_LABELS[sub] : ""} — the live database already has every mark this source has. Try another source or subject.</div>}
+            {rows.map(r => (
+              <label key={r.key} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "8px 0", borderBottom: "1px solid #f0f0f0", fontSize: 13 }}>
+                <input type="checkbox" checked={!off[r.key]} onChange={e => setOff(o => ({ ...o, [r.key]: !e.target.checked }))} style={{ marginTop: 3 }} />
+                <span>
+                  <b>{prettyKey(r.key)}</b><br />
+                  {r.type === "scores"
+                    ? <span style={{ color: "#555" }}>{r.fill} blank mark(s) can be filled{r.differ > 0 ? ", " + r.differ + " differ" : ""} · now {r.liveN} → backup {r.snapN}</span>
+                    : <span style={{ color: "#555" }}>{r.fill ? "comment is empty now" : "comment differs"}</span>}
+                </span>
+              </label>
+            ))}
+            {rows.length > 0 && <button style={{ ...btn("#c2410c"), marginTop: 10 }} disabled={!!busy || chosen.length === 0} onClick={doRestore}>♻ Restore {chosen.length} selected</button>}
+          </div>
+        )}
+
+        <button style={btn("#555")} onClick={onDone}>← Back</button>
+      </div>
+    </div>
+  );
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 // Every subject's mark is a single score out of 100 (Mid Term / End Term).
 // subjectTotal() is the one place that normalizes it for grading/ranking/printing.
@@ -1970,6 +2260,83 @@ function PrintableClassList({ learners, grade, stream, term, year, classTeacher,
   );
 }
 
+// ─── LEARNER TREND CHART ─────────────────────────────────────────────────────
+// Compact, full-width line chart of a learner's TOTAL POINTS across every exam on record
+// (max possible = number of subjects x 8). The viewBox is a fixed width so the chart always
+// runs edge-to-edge of the report form and its printed height stays small and constant,
+// however many exams there are.
+function TrendChart({ data }) {
+  const pts = data || [];
+  const isNum = v => typeof v === "number" && !isNaN(v);
+  const real = pts.filter(d => isNum(d.points));
+  if (real.length < 2) return null;
+  const n = pts.length;
+  const maxPts = SUBJECTS.length * 8;
+  const W = 640, padL = 26, padR = 16, padT = 13;
+  const innerW = W - padL - padR;
+  const spacing = n > 1 ? innerW / (n - 1) : innerW;
+  const rotate = spacing < 50;            // few exams -> flat labels; many -> slanted
+  const padB = rotate ? 36 : 17;
+  const innerH = 50;
+  const H = padT + innerH + padB;
+  const vals = real.map(d => d.points);
+  const pad = Math.max(4, Math.round(maxPts * 0.08));
+  const minSpan = Math.max(12, Math.round(maxPts * 0.25));
+  let lo = Math.max(0, Math.floor((Math.min(...vals) - pad) / 4) * 4);
+  let hi = Math.min(maxPts, Math.ceil((Math.max(...vals) + pad) / 4) * 4);
+  if (hi - lo < minSpan) { lo = Math.max(0, hi - minSpan); if (hi - lo < minSpan) hi = Math.min(maxPts, lo + minSpan); }
+  if (hi <= lo) hi = lo + 1;
+  const mid = Math.round((lo + hi) / 2);
+  const xAt = i => n > 1 ? padL + (innerW * i) / (n - 1) : padL + innerW / 2;
+  const yAt = v => padT + innerH - ((Math.max(lo, Math.min(hi, v)) - lo) * innerH) / (hi - lo);
+  const marks = pts.map(d => isNum(d.points) ? d.points : null);
+  const segs = []; let cur = [];
+  marks.forEach((v, i) => { if (v == null) { if (cur.length) segs.push(cur); cur = []; } else cur.push([i, v]); });
+  if (cur.length) segs.push(cur);
+  const path = segs.map(sg => sg.map(([i, v], k) => `${k === 0 ? "M" : "L"}${xAt(i).toFixed(1)} ${yAt(v).toFixed(1)}`).join(" ")).join(" ");
+  const showVals = spacing >= 24;
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",background:"#fff",overflow:"visible"}}>
+      {[lo, mid, hi].map(g => (
+        <g key={g}>
+          <line x1={padL} y1={yAt(g)} x2={W-padR} y2={yAt(g)} stroke="#e3e3e3" strokeWidth="0.8" />
+          <text x={padL-4} y={yAt(g)+2.2} fontSize="6.5" textAnchor="end" fill="#666">{g}</text>
+        </g>
+      ))}
+      <line x1={padL} y1={padT} x2={padL} y2={padT+innerH} stroke="#333" strokeWidth="0.9" />
+      <line x1={padL} y1={padT+innerH} x2={W-padR} y2={padT+innerH} stroke="#333" strokeWidth="0.9" />
+      <path d={path} fill="none" stroke="#2e7d4f" strokeWidth="1.6" />
+      {pts.map((d, i) => {
+        const mx = xAt(i), v = marks[i];
+        const nearTop = v != null && yAt(v) < padT + 7;
+        return (
+          <g key={i}>
+            {v != null && (
+              <g>
+                <g transform={`translate(${mx},${yAt(v)}) rotate(45)`}>
+                  <rect x="-2.6" y="-2.6" width="5.2" height="5.2" fill="#2e7d4f" />
+                </g>
+                {showVals && (
+                  <text x={mx} y={nearTop ? yAt(v)+10 : yAt(v)-5} fontSize="6.3" textAnchor="middle" fill="#111"
+                        fontWeight={d.current ? "800" : "600"}>{Math.round(v)}</text>
+                )}
+              </g>
+            )}
+            {rotate ? (
+              <text x={0} y={0} fontSize="6.3" fill="#333" textAnchor="end"
+                    transform={`translate(${mx+2},${padT+innerH+6}) rotate(-55)`}
+                    fontWeight={d.current ? "800" : "400"}>{d.label}</text>
+            ) : (
+              <text x={mx} y={padT+innerH+11} fontSize="6.8" fill="#333" textAnchor="middle"
+                    fontWeight={d.current ? "800" : "400"}>{d.label}</text>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 // ─── REPORT CARD ─────────────────────────────────────────────────────────────
 function ReportCard({ learner, grade, stream, term, year, classTeacher, closingDay, openingDay, totalInClass, overallTotal, comment, prevTotal, subjectRanks, examHistory, schoolName, schoolCounty, schoolMotto, schoolPOBox, schoolPhone, schoolEmail }) {
   const label = stream ? `Grade ${grade} ${stream}` : `Grade ${grade}`;
@@ -2015,7 +2382,7 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
             return (
               <tr key={sub} style={{background:i%2===0?"#fff":"#f5f5f5"}}>
                 <td style={RC.td}><b>{subjectKey(sub)}</b></td>
-                <td style={{...RC.tdC,fontWeight:800,fontSize:14}}>{tot!==""?tot:"–"}</td>
+                <td style={{...RC.tdC,fontWeight:800,fontSize:12}}>{tot!==""?tot:"–"}</td>
                 <td style={RC.tdC}>{g?<span style={RC.codeBadge}>{g.sub}</span>:"–"}</td>
                 <td style={{...RC.tdC,fontWeight:700}}>{g?.points||"–"}</td>
                 <td style={{...RC.tdC,fontWeight:700,color:"#1d4ed8"}}>{sRank}</td>
@@ -2052,7 +2419,7 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
         if (!anyData) return null;
         const strongest = pathways.reduce((a,b)=> b.percent > a.percent ? b : a, pathways[0]);
         return (
-          <div style={{marginBottom:10}}>
+          <div style={{marginBottom:6}}>
             <div style={RC.sectionTitle}>PATHWAY PERFORMANCE PROFILE</div>
             <table style={RC.table}>
               <thead>
@@ -2081,7 +2448,7 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
                 ))}
               </tbody>
             </table>
-            <div style={{fontSize:9.5,color:"#222",marginTop:2}}>
+            <div style={{fontSize:9,color:"#222",marginTop:1}}>
               <b>Strongest Pathway: {strongest.name} ({strongest.percent}%).</b> The learner demonstrates a
               {" "}{strongest.percent>=70?"strong":strongest.percent>=50?"developing":"emerging"} inclination
               towards the {strongest.name} pathway based on the areas assessed this term.
@@ -2090,31 +2457,43 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
         );
       })()}
 
+      {examHistory && examHistory.filter(d=>typeof d.points==="number" && !isNaN(d.points)).length >= 2 && (
+        <div style={{marginBottom:6}}>
+          <div style={{...RC.sectionTitle,display:"flex",justifyContent:"space-between",alignItems:"flex-end"}}>
+            <span>PERFORMANCE OVER TIME</span>
+            <span style={{fontWeight:600,fontSize:7.5,letterSpacing:0,textTransform:"none",color:"#333"}}>
+              <span style={{display:"inline-block",width:7,height:7,background:"#2e7d4f",transform:"rotate(45deg)",marginRight:4}}></span>Total points (out of {SUBJECTS.length*8})
+            </span>
+          </div>
+          <TrendChart data={examHistory} />
+        </div>
+      )}
+
       {comment && String(comment).trim() && (
-        <div style={{marginBottom:8}}>
+        <div style={{marginBottom:6}}>
           <div style={RC.sectionTitle}>CLASS TEACHER'S COMMENT</div>
-          <div style={{border:"1px solid #bbb",padding:"6px 8px",fontSize:10.5,minHeight:22,whiteSpace:"pre-wrap",color:"#000"}}>{comment}</div>
+          <div style={{border:"1px solid #bbb",padding:"4px 7px",fontSize:10,minHeight:18,whiteSpace:"pre-wrap",color:"#000"}}>{comment}</div>
         </div>
       )}
 
       <div style={RC.bottomRow}>
-        <div style={RC.gradingKey}>
+        <div style={{flex:1,minWidth:0}}>
           <div style={RC.keyTitle}>GRADING KEY</div>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:9}}>
-            <thead><tr style={{background:"#000",color:"#fff"}}><th style={RC.kth}>Code</th><th style={RC.kth}>Range</th><th style={RC.kth}>Pts</th></tr></thead>
-            <tbody>{GRADES.map(g=>(
-              <tr key={g.sub}>
-                <td style={{...RC.ktd,fontWeight:700}}>{g.sub}</td>
-                <td style={RC.ktd}>{g.min}–{g.max}%</td>
-                <td style={RC.ktd}>{g.points}</td>
-              </tr>
-            ))}</tbody>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:8}}>
+            <thead><tr style={{background:"#000",color:"#fff"}}>
+              <th style={RC.kth}>Code</th>
+              {GRADES.map(g=><th key={g.sub} style={RC.kth}>{g.sub}</th>)}
+            </tr></thead>
+            <tbody>
+              <tr><td style={{...RC.ktd,fontWeight:700}}>Range</td>{GRADES.map(g=><td key={g.sub} style={RC.ktd}>{g.min}–{g.max}%</td>)}</tr>
+              <tr><td style={{...RC.ktd,fontWeight:700}}>Pts</td>{GRADES.map(g=><td key={g.sub} style={RC.ktd}>{g.points}</td>)}</tr>
+            </tbody>
           </table>
         </div>
-        <div style={RC.datesBox}>
+        <div style={{...RC.datesBox,flex:"0 0 138px"}}>
           <div style={RC.keyTitle}>CLASS INFORMATION</div>
-          <div style={RC.datesLine}>Closing Day: <b>{fmtDate(closingDay)}</b></div>
-          <div style={RC.datesLine}>Opening Day: <b>{fmtDate(openingDay)}</b></div>
+          <div style={{...RC.datesLine,marginBottom:3}}>Closing Day: <b>{fmtDate(closingDay)}</b></div>
+          <div style={{...RC.datesLine,marginBottom:0}}>Opening Day: <b>{fmtDate(openingDay)}</b></div>
           {/* Exam progress table removed */}
         </div>
       </div>
@@ -2339,6 +2718,7 @@ function App() {
   const [showTeacherAdmin, setShowTeacherAdmin] = useState(false);
   const [showSchoolSettings, setShowSchoolSettings] = useState(false);
   const [showManageClasses, setShowManageClasses] = useState(false);
+  const [showRestore, setShowRestore] = useState(false);
 
   const [page, setPage]           = useState("home");
   const [grade, setGrade]         = useState(GRADE_LOCK || "8");
@@ -2436,6 +2816,7 @@ function App() {
   const subjectDirtyRef  = useRef(false);
   const subjectLoadSeq   = useRef(0);
   const subjectListKeyRef = useRef("");
+  const subjectBaselineRef = useRef({});
   function markSubjectDirty(v) { subjectDirtyRef.current = v; setSubjectDirty(v); }
   // Ask before a Term / Year / Subject change throws away typed-but-unuploaded marks.
   function okToLeaveSubjectList() {
@@ -2507,6 +2888,7 @@ function App() {
       // Same class/subject/term already on screen with unsaved typing: keep the typing.
       if (subjectDirtyRef.current && subjectListKeyRef.current === listKey) return;
       subjectListKeyRef.current = listKey;
+      subjectBaselineRef.current = Object.fromEntries(list.map(r => [r.name, r.score]));
       markSubjectDirty(false);
       setSubjectList(list);
     } finally {
@@ -2546,11 +2928,12 @@ function App() {
       subjectList.forEach(row => { updates[row.name] = row.score; });
       const rosterNames = subjectList.map(row => row.name);
       const key = storageKey(subjectClass.grade, subjectClass.stream, subjectTerm, subjectYear);
-      const ok = await saveSubjectScores(key, subjectChoice, updates, rosterNames);
+      const ok = await saveSubjectScores(key, subjectChoice, updates, rosterNames, subjectBaselineRef.current);
       if (ok) {
         markSubjectDirty(false);
         setSubjectSaved(true);
         setTimeout(()=>setSubjectSaved(false), 2500);
+        loadSubjectEntryList(); // re-read from GitHub so the screen shows exactly what was stored
       } else {
         alert("Upload failed. Check your internet connection and try again. Your entries are still on screen — do not close the app.");
       }
@@ -2569,6 +2952,7 @@ function App() {
   // "rank" = sorted by performance, "name" = alphabetical (handy for entering marks)
   const [sortMode, setSortMode]             = useState("rank");
   const downloadRef = useRef(null);
+  const baselineRef = useRef(null);
   const csvInputRef = useRef(null);
   const xlsxInputRef = useRef(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
@@ -2628,85 +3012,91 @@ function App() {
     if (n !== subjectTerm) setSubjectTerm(n);
   },[subjectClass, subjectTerm]);
 
-  // Exam history state — all terms from Mid Term 2 2026 up to AND INCLUDING current term
-  const [examHistoryMap, setExamHistoryMap] = useState({});
+  // ── Exam history (feeds the "Performance over time" trend on each report form) ──
+  // Walks back through every earlier term, earlier years AND earlier grades (7 -> 8 -> 9),
+  // so a learner's full JSS journey shows. Earlier results are read from the saved term
+  // records (they are never altered); the CURRENT term is added live from the marks on screen,
+  // so the trend always matches what is being printed.
+  const [pastHist, setPastHist] = useState({ key: "", map: {}, curLabel: "" });
+  const histKey = `${grade}|${term}|${year}`;
   useEffect(()=>{
-    if (page!=="results") return;
+    // Wait for the real class list: until then classesConfig is only a placeholder
+    // (one blank class per grade) and every split class's saved terms would be missed.
+    if (page!=="results" || !classesConfigLoaded) return;
     let active = true;
     (async()=>{
-      const START_TERM = "Mid Term 2";
-      const START_YEAR = 2026;
+      const curGradeNum = parseInt(grade);
       const curY = parseInt(year);
-      const TL = termsFor(grade);
-      const curIdx = TL.indexOf(term);
-      const startIdx = TL.indexOf(START_TERM);
+      const curTerm = normTerm(term, grade);
 
-      // Build chronological list of all term/year combos from MT2 2026 to current (inclusive)
       const allTermYears = [];
-      let y = START_YEAR;
-      let tidx = startIdx;
-      while (y < curY || (y === curY && tidx <= curIdx)) {
-        const shortYear = y !== curY ? ` '${String(y).slice(2)}` : "";
-        const shortTerm = shortTermLabel(TL[tidx]);
-        allTermYears.push({
-          label: shortTerm + shortYear,
-          term: TL[tidx],
-          year: String(y),
-          isCurrent: y === curY && tidx === curIdx
-        });
-        tidx++;
-        if (tidx >= TL.length) { tidx = 0; y++; }
-      }
-
-      const allNames = combinedForRanks.map(l => l.name);
-      const histMap = {};
-      allNames.forEach(n => histMap[n] = []);
-
-      for (const { label, term: t, year: ry, isCurrent } of allTermYears) {
-        if (isCurrent) {
-          // Use already-loaded ranked data — no extra fetch needed
-          combinedForRanks.forEach(l => {
-            if (!histMap[l.name]) return;
-            const hasSc = SUBJECTS.some(s => Number(l.scores?.[s]) > 0);
-            histMap[l.name].push({
-              label,
-              level: hasSc ? (l.level || "–") : "–",
-              points: hasSc ? (l.points || "–") : "–"
-            });
-          });
-        } else {
-          let allData = [];
-          if (isSplitGrade(grade)) {
-            const e = (await loadShared(storageKey(grade,"East",t,ry), [])) || [];
-            const w = (await loadShared(storageKey(grade,"West",t,ry), [])) || [];
-            allData = [...e, ...w];
-          } else {
-            allData = (await loadShared(storageKey(grade,"",t,ry), [])) || [];
-          }
-          const dataMap = {};
-          allData.forEach(l => { dataMap[l.name] = l; });
-          allNames.forEach(name => {
-            if (!histMap[name]) return;
-            const l = dataMap[name];
-            if (l) {
-              const sc = l.scores || {};
-              const hasSc = SUBJECTS.some(s => Number(sc[s]) > 0);
-              const pts = SUBJECTS.map(s => getGrade(sc[s])?.points||0).reduce((a,b)=>a+b,0);
-              const ptAvg = SUBJECTS.length ? pts/SUBJECTS.length : 0;
-              let lvl = "BE";
-              if (ptAvg>=7.5) lvl="EE"; else if (ptAvg>=5.5) lvl="ME"; else if (ptAvg>=3.0) lvl="AE";
-              histMap[name].push({ label, level: hasSc?lvl:"–", points: hasSc?pts:"–" });
-            } else {
-              histMap[name].push({ label, level: "–", points: "–" });
-            }
+      for (let gNum = 7; gNum <= curGradeNum; gNum++) {
+        const gStr = String(gNum);
+        const gYear = curY - (curGradeNum - gNum);   // one grade per calendar year
+        const TLg = termsFor(gStr);                  // Grade 9 has its own Term 3 assessments
+        const lastIdx = (gNum === curGradeNum) ? TLg.indexOf(curTerm) : TLg.length - 1;
+        for (let tidx = 0; tidx <= lastIdx && tidx < TLg.length; tidx++) {
+          allTermYears.push({
+            label: (curGradeNum > 7 ? `G${gNum} ` : "") + shortTermLabel(TLg[tidx]) + ` '${String(gYear).slice(2)}`,
+            grade: gStr, term: TLg[tidx], year: String(gYear),
+            isCurrent: gNum === curGradeNum && tidx === lastIdx
           });
         }
       }
-      if (active) setExamHistoryMap(histMap);
+
+      const names = combinedForRanks.map(l => l.name);
+      const map = {};
+      names.forEach(n => map[n] = []);
+      let curLabel = "";
+
+      for (const { label, grade: g, term: t, year: ry, isCurrent } of allTermYears) {
+        if (isCurrent) { curLabel = label; continue; }
+        // Read every class this grade has ever stored results under — the current classes,
+        // the blank "Main" class (results saved before a grade was split) and legacy East/West —
+        // so no saved term is lost when classes are renamed, split or merged.
+        const streams = Array.from(new Set([...(classesConfig[g] || [""]), "", "East", "West"]));
+        const lists = await Promise.all(streams.map(st => loadShared(storageKey(g, st, t, ry), [])));
+        const byName = {};
+        lists.forEach(lst => (lst || []).forEach(l => {
+          if (!l || !l.name) return;
+          const has = SUBJECTS.some(sb => Number((l.scores||{})[sb]) > 0);
+          if (!byName[l.name] || (has && !byName[l.name].has)) byName[l.name] = { rec: l, has };
+        }));
+        names.forEach(name => {
+          const hit = byName[name];
+          if (hit && hit.has) {
+            const st = calcStats(hit.rec.scores || {});
+            map[name].push({ label, level: st.level, points: st.points, avg: Number(st.avg), current: false });
+          } else {
+            map[name].push({ label, level: "–", points: null, avg: null, current: false });
+          }
+        });
+      }
+      if (active) setPastHist({ key: histKey, map, curLabel });
     })();
     return ()=>{ active=false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[page, grade, term, year]);
+  },[page, grade, term, year, classesConfigLoaded]);
+
+  // Per-learner history = saved earlier exams + the live current exam, with leading blank
+  // terms trimmed so each chart starts exactly where that learner's real results begin
+  // (gaps in the middle stay — those are genuinely missing exams).
+  const examHistoryMap = {};
+  {
+    const past = pastHist.key === histKey ? pastHist : { map: {}, curLabel: "" };
+    combinedForRanks.forEach(l => {
+      const hasSc = SUBJECTS.some(sb => Number(l.scores?.[sb]) > 0);
+      const arr = [...(past.map[l.name] || []), {
+        label: past.curLabel || shortTermLabel(term),
+        level: hasSc ? (l.level || "–") : "–",
+        points: hasSc ? (l.points ?? null) : null,
+        avg: hasSc ? Number(l.avg) : null,
+        current: true
+      }];
+      const first = arr.findIndex(d => d.avg != null || d.points != null);
+      examHistoryMap[l.name] = first === -1 ? [] : arr.slice(first);
+    });
+  }
 
   useEffect(()=>{
     function handleBeforeUnload(e) {
@@ -2808,6 +3198,11 @@ function App() {
         loaded[s] = lrns;
       }
       setLearnersByStreamState(loaded);
+      {
+        const map = {};
+        Object.keys(loaded).forEach(s => { map[s] = Object.fromEntries(loaded[s].map(l => [l.name, { ...(l.scores || {}) }])); });
+        baselineRef.current = { grade, term, year, map };
+      }
       if (classList.length > 1 && !classList.includes(stream)) setStream(classList[0]);
       setPage("results");
       setSaved(false);
@@ -2824,14 +3219,54 @@ function App() {
     }
     setSaving(true);
     try {
-      const classList = classesConfig[grade] || [""];
-      let ok = true;
-      for (const s of classList) {
-        const data = (learnersByStream[s]||[]).map(l=>({name:l.name,admNo:l.admNo||"",gender:l.gender||"",scores:l.scores}));
-        ok = await saveShared(learnersKey(grade,s), data) && ok;
-        ok = await saveShared(storageKey(grade,s,term,year), data) && ok;
-      }
+      const meta = baselineRef.current || { grade, term, year, map: {} };
+      const g = meta.grade, t = meta.term, y = meta.year;
+      const classList = classesConfig[g] || [""];
+      const mergedOut = {};
+      const ok = await mutateDB(db => {
+        classList.forEach(s => {
+          const local = learnersByStream[s] || [];
+          const baseMap = meta.map ? meta.map[s] : undefined;
+          const known = n => !!(baseMap && Object.prototype.hasOwnProperty.call(baseMap, n));
+          const localNames = new Set(local.map(l => l.name));
+
+          // marks: merge cell-by-cell with whatever is in the live database right now
+          const sKey = storageKey(g, s, t, y);
+          const remoteArr = Array.isArray(db[sKey]) ? db[sKey] : [];
+          const remoteBy = {}; remoteArr.forEach(r => { remoteBy[r.name] = r; });
+          const merged = local.map(l => {
+            const r = remoteBy[l.name];
+            const b = baseMap ? baseMap[l.name] : undefined;
+            const scores = { ...(l.scores || {}), ...((r && r.scores) || {}) };
+            SUBJECTS.forEach(sub => {
+              scores[sub] = decideCell(l.scores && l.scores[sub], b ? b[sub] : undefined, r && r.scores ? r.scores[sub] : undefined);
+            });
+            return { name: l.name, admNo: l.admNo || "", gender: l.gender || "", scores };
+          });
+          // learners someone else added while this screen was open must not be dropped
+          remoteArr.forEach(r => { if (!localNames.has(r.name) && !known(r.name)) merged.push(r); });
+          db[sKey] = merged;
+          mergedOut[s] = merged;
+
+          // roster (names only; marks live in the term list above)
+          const lKey = learnersKey(g, s);
+          const remoteRoster = Array.isArray(db[lKey]) ? db[lKey] : [];
+          const roster = local.map(l => ({ name: l.name, admNo: l.admNo || "", gender: l.gender || "" }));
+          remoteRoster.forEach(r => { if (!localNames.has(r.name) && !known(r.name)) roster.push({ name: r.name, admNo: r.admNo || "", gender: r.gender || "" }); });
+          db[lKey] = roster;
+        });
+      }, undefined, "Marks save: Grade " + g + " " + t + " " + y);
       if (ok) {
+        // show exactly what is now stored (includes other teachers' uploads) and reset the baseline
+        const map = {}, nextState = {};
+        classList.forEach(s => {
+          const m = mergedOut[s] || [];
+          const localBy = {}; (learnersByStream[s] || []).forEach(l => { localBy[l.name] = l; });
+          map[s] = Object.fromEntries(m.map(l => [l.name, { ...(l.scores || {}) }]));
+          nextState[s] = m.map(l => ({ ...(localBy[l.name] || {}), ...l }));
+        });
+        baselineRef.current = { grade: g, term: t, year: y, map };
+        setLearnersByStreamState(prev => ({ ...prev, ...nextState }));
         setSaved(true); setDirty(false); setTimeout(()=>setSaved(false), 2500);
       } else {
         alert("Save failed. Check your internet connection and GitHub token, then try again. Your changes are still on screen but NOT saved yet - do not close the app.");
@@ -2904,7 +3339,8 @@ function App() {
 <style>
   body{margin:0;background:#fff;font-family:Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   .no-print{display:none!important;}
-  .report-card{page-break-inside:avoid;}
+  .report-card{page-break-inside:avoid;break-inside:avoid;}
+  .report-card + .report-card{page-break-before:always;break-before:page;}
   @page{size:A4 ${isList?"landscape":"portrait"};margin:0.7cm;}
   table{border-collapse:collapse;}
   #__printBtnBar{position:sticky;top:0;background:#111;padding:10px;text-align:center;z-index:999;}
@@ -2912,12 +3348,52 @@ function App() {
 </style>
 </head><body>
 <div id="__printBtnBar" class="no-print"><button onclick="window.print()">🖨 Print This Page</button></div>
-${node.innerHTML}
+${(node.classList && node.classList.contains("report-card")) ? node.outerHTML : node.innerHTML}
 ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.print();},300);};</scr"+"ipt>" : ""}
 </body></html>`;
   }
 
   const [pdfBusy, setPdfBusy] = useState(false);
+
+  // Builds a detached, fully-laid-out copy of the content for PDF capture. The live source
+  // sits in a 0x0 hidden box far off-screen, and html2pdf's own overlay is only as tall as the
+  // browser window — either can make the capture clip the page. Here every report card is
+  // measured at its real size and, if it is taller than one A4 page, scaled down to fit, so a
+  // report always lands whole on a single page.
+  function stageForPdf(node, isList) {
+    const PX = 96;
+    const pageW = (isList ? 11.69 : 8.27) - 0.6;          // inches inside the 0.3in margins
+    const pageH = (isList ? 8.27 : 11.69) - 0.6;
+    const stage = document.createElement("div");
+    stage.style.cssText = `position:absolute;left:-20000px;top:0;width:${Math.round(pageW*PX)}px;background:#fff;`;
+    const isCard = node.classList && node.classList.contains("report-card");
+    const holder = document.createElement("div");
+    holder.style.cssText = "background:#fff;";
+    holder.innerHTML = isCard ? node.outerHTML : node.innerHTML;
+    stage.appendChild(holder);
+    document.body.appendChild(stage);
+    if (!isList) {
+      const maxH = pageH * PX - 6;
+      const cards = Array.from(holder.querySelectorAll(".report-card"));
+      cards.forEach((card, idx) => {
+        const h = card.offsetHeight;
+        const wrap = document.createElement("div");
+        card.parentNode.insertBefore(wrap, card);
+        wrap.appendChild(card);
+        card.style.margin = "0 auto";
+        if (h > maxH) {
+          const sc = maxH / h;
+          card.style.transform = `scale(${sc.toFixed(4)})`;
+          card.style.transformOrigin = "top center";
+          wrap.style.height = Math.floor(h * sc) + "px";
+        }
+        wrap.style.overflow = "visible";
+        if (idx > 0) wrap.style.pageBreakBefore = "always";
+      });
+    }
+    return { stage, target: holder };
+  }
+
   async function handleDownload(mode, filename) {
     const isList = mode==="blank" || mode==="filled";
     const node = findPrintNode(mode);
@@ -2927,18 +3403,29 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
       return;
     }
     setPdfBusy(true);
+    const savedX = window.scrollX, savedY = window.scrollY;
+    let staged = null;
     try {
+      window.scrollTo(0, 0);   // html2canvas offsets/clips the capture if the page is scrolled
+      staged = stageForPdf(node, isList);
       await html2pdf().set({
         margin: 0.3,
         filename: `${filename}.pdf`,
         image: { type: "jpeg", quality: 0.98 },
-        html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+        html2canvas: {
+          scale: 2, useCORS: true, backgroundColor: "#ffffff",
+          scrollX: 0, scrollY: 0,
+          windowWidth: Math.max(document.documentElement.clientWidth, 1100),
+          windowHeight: Math.max(staged.target.scrollHeight, window.innerHeight)
+        },
         jsPDF: { unit: "in", format: "a4", orientation: isList ? "landscape" : "portrait" },
         pagebreak: { mode: ["css", "legacy"] }
-      }).from(node).save();
+      }).from(staged.target).save();
     } catch (e) {
       alert("Could not generate the PDF. Please try again — if it keeps failing, use the 🖨 Print button instead and choose 'Save as PDF' from the print dialog.");
     } finally {
+      if (staged && staged.stage.parentNode) staged.stage.parentNode.removeChild(staged.stage);
+      window.scrollTo(savedX, savedY);
       setPdfBusy(false);
     }
   }
@@ -3182,6 +3669,8 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
       setSchoolPOBox(poBox); setSchoolPhone(phone); setSchoolEmail(email);
     }}
     onDone={() => setShowSchoolSettings(false)} />;
+  if (showRestore) return <RestoreScreen onDone={() => setShowRestore(false)} />;
+
   if (showManageClasses) return <ManageClassesScreen
     classesConfig={classesConfig}
     onSave={(cfg)=>{
@@ -3231,6 +3720,9 @@ ${autoPrint ? "<scr"+"ipt>window.onload=function(){setTimeout(function(){window.
           </button>}
           {userSession.role === "admin" && <button onClick={()=>setShowWizard(true)} style={{fontSize:11,padding:"4px 12px",background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.4)",borderRadius:20,color:"#fff",cursor:"pointer"}}>
             🔄 Re-run Year Setup
+          </button>}
+          {userSession.role === "admin" && <button onClick={()=>setShowRestore(true)} style={{fontSize:11,padding:"4px 12px",background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.4)",borderRadius:20,color:"#fff",cursor:"pointer"}}>
+            🛟 Backup & Restore
           </button>}
         </div>
       </div>
@@ -3767,37 +4259,37 @@ const S = {
 };
 
 const RC = {
-  page:        {background:"#fff",color:"#000",width:"190mm",minHeight:"160mm",margin:"0 auto 4mm",padding:"10mm 12mm",fontFamily:"Arial,sans-serif",fontSize:11,boxSizing:"border-box",border:"1px solid #888"},
-  header:      {borderBottom:"3px solid #000",marginBottom:8,paddingBottom:7,textAlign:"center"},
-  schoolName:  {fontSize:20,fontWeight:900,letterSpacing:1,color:"#000"},
-  schoolSub:   {fontSize:10,color:"#444"},
-  reportTitle: {fontSize:12,fontWeight:700,marginTop:4,color:"#000"},
-  infoRow:     {display:"flex",gap:8,flexWrap:"wrap",background:"#f2f2f2",padding:"7px 10px",borderRadius:4,marginBottom:8,border:"1px solid #ccc"},
+  page:        {background:"#fff",color:"#000",width:"190mm",minHeight:"160mm",margin:"0 auto 4mm",padding:"7mm 8mm",fontFamily:"Arial,sans-serif",fontSize:11,boxSizing:"border-box",border:"1px solid #888"},
+  header:      {borderBottom:"3px solid #000",marginBottom:6,paddingBottom:5,textAlign:"center"},
+  schoolName:  {fontSize:18,fontWeight:900,letterSpacing:1,color:"#000"},
+  schoolSub:   {fontSize:9.5,color:"#444"},
+  reportTitle: {fontSize:11.5,fontWeight:700,marginTop:3,color:"#000"},
+  infoRow:     {display:"flex",gap:6,flexWrap:"wrap",background:"#f2f2f2",padding:"5px 8px",borderRadius:4,marginBottom:6,border:"1px solid #ccc"},
   infoBlock:   {display:"flex",gap:4,alignItems:"center",flex:1},
-  infoLabel:   {fontWeight:800,fontSize:9,color:"#444",textTransform:"uppercase"},
-  infoVal:     {fontWeight:700,fontSize:11,color:"#000"},
-  sectionTitle:{fontWeight:900,fontSize:10,letterSpacing:1,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:5,textTransform:"uppercase"},
-  table:       {width:"100%",borderCollapse:"collapse",marginBottom:8},
-  th:          {background:"#000",color:"#fff",padding:"5px 7px",fontWeight:700,fontSize:10,textAlign:"left",border:"1px solid #888"},
-  thC:         {background:"#000",color:"#fff",padding:"5px 7px",fontWeight:700,fontSize:10,textAlign:"center",border:"1px solid #888"},
-  td:          {padding:"5px 7px",border:"1px solid #ddd",color:"#000"},
-  tdC:         {padding:"5px 7px",border:"1px solid #ddd",textAlign:"center",color:"#000"},
-  codeBadge:   {fontWeight:900,fontSize:11,color:"#000",border:"1.5px solid #000",borderRadius:3,padding:"1px 5px"},
-  summaryBox:  {display:"flex",border:"2px solid #000",overflow:"hidden",marginBottom:10},
-  summaryItem: {flex:1,padding:"7px 5px",textAlign:"center",borderRight:"1px solid #bbb"},
-  sumLabel:    {fontSize:8,color:"#555",textTransform:"uppercase",letterSpacing:0.5},
-  sumVal:      {fontSize:14,fontWeight:900,color:"#000"},
-  bottomRow:   {display:"flex",gap:10,marginBottom:8},
+  infoLabel:   {fontWeight:800,fontSize:8.5,color:"#444",textTransform:"uppercase"},
+  infoVal:     {fontWeight:700,fontSize:10.5,color:"#000"},
+  sectionTitle:{fontWeight:900,fontSize:9.5,letterSpacing:1,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:4,textTransform:"uppercase"},
+  table:       {width:"100%",borderCollapse:"collapse",marginBottom:6},
+  th:          {background:"#000",color:"#fff",padding:"3px 6px",fontWeight:700,fontSize:9.5,textAlign:"left",border:"1px solid #888"},
+  thC:         {background:"#000",color:"#fff",padding:"3px 6px",fontWeight:700,fontSize:9.5,textAlign:"center",border:"1px solid #888"},
+  td:          {padding:"3px 6px",border:"1px solid #ddd",color:"#000",fontSize:10.5},
+  tdC:         {padding:"3px 6px",border:"1px solid #ddd",textAlign:"center",color:"#000",fontSize:10.5},
+  codeBadge:   {fontWeight:900,fontSize:10.5,color:"#000",border:"1.5px solid #000",borderRadius:3,padding:"0px 5px"},
+  summaryBox:  {display:"flex",border:"2px solid #000",overflow:"hidden",marginBottom:7},
+  summaryItem: {flex:1,padding:"4px 4px",textAlign:"center",borderRight:"1px solid #bbb"},
+  sumLabel:    {fontSize:7.5,color:"#555",textTransform:"uppercase",letterSpacing:0.5},
+  sumVal:      {fontSize:13,fontWeight:900,color:"#000"},
+  bottomRow:   {display:"flex",gap:10,marginBottom:4},
   gradingKey:  {width:140,flexShrink:0},
-  keyTitle:    {fontWeight:900,fontSize:9,letterSpacing:0.5,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:4,textTransform:"uppercase"},
-  kth:         {padding:"3px 5px",fontWeight:700,fontSize:8,textAlign:"center",border:"1px solid #000"},
-  ktd:         {padding:"3px 5px",textAlign:"center",fontSize:8,border:"1px solid #999",color:"#000"},
-  datesBox:    {flex:1,border:"1px solid #bbb",borderRadius:4,padding:"8px 10px"},
+  keyTitle:    {fontWeight:900,fontSize:8.5,letterSpacing:0.5,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:3,textTransform:"uppercase"},
+  kth:         {padding:"2px 3px",fontWeight:700,fontSize:7.5,textAlign:"center",border:"1px solid #000"},
+  ktd:         {padding:"2px 3px",textAlign:"center",fontSize:7.5,border:"1px solid #999",color:"#000"},
+  datesBox:    {flex:1,border:"1px solid #bbb",borderRadius:4,padding:"5px 8px"},
   commentInline: {marginTop:6,paddingTop:6,borderTop:"1px dashed #999"},
   commentLabel: {fontSize:8,fontWeight:800,letterSpacing:0.5,color:"#333"},
   commentText: {fontSize:9.5,lineHeight:1.4,color:"#222",marginTop:2,fontStyle:"italic"},
-  datesLine:   {fontSize:10,color:"#000",marginBottom:6},
-  footer:      {textAlign:"center",fontSize:8,color:"#555",borderTop:"1px solid #bbb",paddingTop:5,marginTop:4},
+  datesLine:   {fontSize:9.5,color:"#000",marginBottom:4},
+  footer:      {textAlign:"center",fontSize:8,color:"#555",borderTop:"1px solid #bbb",paddingTop:4,marginTop:2},
 };
 
 const CL = {
