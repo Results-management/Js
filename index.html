@@ -3059,7 +3059,7 @@ function App() {
         const byName = {};
         lists.forEach(lst => (lst || []).forEach(l => {
           if (!l || !l.name) return;
-          const has = SUBJECTS.some(sb => Number((l.scores||{})[sb]) > 0);
+          const has = SUBJECTS.filter(sb => Number((l.scores||{})[sb]) > 0).length >= 7; // partial sheets (e.g. G7 Mid Term 1: 5 subjects) would plot a false dip
           if (!byName[l.name] || (has && !byName[l.name].has)) byName[l.name] = { rec: l, has };
         }));
         names.forEach(name => {
