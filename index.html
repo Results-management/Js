@@ -2272,12 +2272,12 @@ function TrendChart({ data }) {
   if (real.length < 2) return null;
   const n = pts.length;
   const maxPts = SUBJECTS.length * 8;
-  const W = 640, padL = 26, padR = 16, padT = 13;
+  const W = 640, padL = 28, padR = 16, padT = 18;
   const innerW = W - padL - padR;
   const spacing = n > 1 ? innerW / (n - 1) : innerW;
   const rotate = spacing < 50;            // few exams -> flat labels; many -> slanted
-  const padB = rotate ? 36 : 17;
-  const innerH = 50;
+  const padB = rotate ? 40 : 20;
+  const innerH = 96;
   const H = padT + innerH + padB;
   const vals = real.map(d => d.points);
   const pad = Math.max(4, Math.round(maxPts * 0.08));
@@ -2290,44 +2290,45 @@ function TrendChart({ data }) {
   const xAt = i => n > 1 ? padL + (innerW * i) / (n - 1) : padL + innerW / 2;
   const yAt = v => padT + innerH - ((Math.max(lo, Math.min(hi, v)) - lo) * innerH) / (hi - lo);
   const marks = pts.map(d => isNum(d.points) ? d.points : null);
-  const segs = []; let cur = [];
-  marks.forEach((v, i) => { if (v == null) { if (cur.length) segs.push(cur); cur = []; } else cur.push([i, v]); });
-  if (cur.length) segs.push(cur);
-  const path = segs.map(sg => sg.map(([i, v], k) => `${k === 0 ? "M" : "L"}${xAt(i).toFixed(1)} ${yAt(v).toFixed(1)}`).join(" ")).join(" ");
+  // ONE continuous line: exams with no marks are skipped, so the line simply runs straight on
+  // from the previous exam to the next one that has marks (no break in the graph).
+  const linePts = [];
+  marks.forEach((v, i) => { if (v != null) linePts.push([i, v]); });
+  const path = linePts.map(([i, v], k) => `${k === 0 ? "M" : "L"}${xAt(i).toFixed(1)} ${yAt(v).toFixed(1)}`).join(" ");
   const showVals = spacing >= 24;
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",background:"#fff",overflow:"visible"}}>
       {[lo, mid, hi].map(g => (
         <g key={g}>
           <line x1={padL} y1={yAt(g)} x2={W-padR} y2={yAt(g)} stroke="#e3e3e3" strokeWidth="0.8" />
-          <text x={padL-4} y={yAt(g)+2.2} fontSize="6.5" textAnchor="end" fill="#666">{g}</text>
+          <text x={padL-4} y={yAt(g)+2.2} fontSize="8" textAnchor="end" fill="#666">{g}</text>
         </g>
       ))}
       <line x1={padL} y1={padT} x2={padL} y2={padT+innerH} stroke="#333" strokeWidth="0.9" />
       <line x1={padL} y1={padT+innerH} x2={W-padR} y2={padT+innerH} stroke="#333" strokeWidth="0.9" />
-      <path d={path} fill="none" stroke="#2e7d4f" strokeWidth="1.6" />
+      <path d={path} fill="none" stroke="#2e7d4f" strokeWidth="2" strokeLinejoin="round" />
       {pts.map((d, i) => {
         const mx = xAt(i), v = marks[i];
-        const nearTop = v != null && yAt(v) < padT + 7;
+        const nearTop = v != null && yAt(v) < padT + 9;
         return (
           <g key={i}>
             {v != null && (
               <g>
                 <g transform={`translate(${mx},${yAt(v)}) rotate(45)`}>
-                  <rect x="-2.6" y="-2.6" width="5.2" height="5.2" fill="#2e7d4f" />
+                  <rect x="-3.4" y="-3.4" width="6.8" height="6.8" fill="#2e7d4f" />
                 </g>
                 {showVals && (
-                  <text x={mx} y={nearTop ? yAt(v)+10 : yAt(v)-5} fontSize="6.3" textAnchor="middle" fill="#111"
+                  <text x={mx} y={nearTop ? yAt(v)+12 : yAt(v)-6} fontSize="8" textAnchor="middle" fill="#111"
                         fontWeight={d.current ? "800" : "600"}>{Math.round(v)}</text>
                 )}
               </g>
             )}
             {rotate ? (
-              <text x={0} y={0} fontSize="6.3" fill="#333" textAnchor="end"
-                    transform={`translate(${mx+2},${padT+innerH+6}) rotate(-55)`}
+              <text x={0} y={0} fontSize="7.5" fill="#333" textAnchor="end"
+                    transform={`translate(${mx+2},${padT+innerH+7}) rotate(-55)`}
                     fontWeight={d.current ? "800" : "400"}>{d.label}</text>
             ) : (
-              <text x={mx} y={padT+innerH+11} fontSize="6.8" fill="#333" textAnchor="middle"
+              <text x={mx} y={padT+innerH+13} fontSize="8" fill="#333" textAnchor="middle"
                     fontWeight={d.current ? "800" : "400"}>{d.label}</text>
             )}
           </g>
@@ -2469,18 +2470,47 @@ function ReportCard({ learner, grade, stream, term, year, classTeacher, closingD
         </div>
       )}
 
-      {comment && String(comment).trim() && (
-        <div style={{marginBottom:6}}>
-          <div style={RC.sectionTitle}>CLASS TEACHER'S COMMENT</div>
-          <div style={{border:"1px solid #bbb",padding:"4px 7px",fontSize:10,minHeight:18,whiteSpace:"pre-wrap",color:"#000"}}>{comment}</div>
+      {(() => {
+        const rows = SUBJECTS.map(sub => ({ name: subjectKey(sub), v: subjectTotal(learner.scores, sub) }))
+          .filter(r => typeof r.v === "number" && !isNaN(r.v));
+        if (rows.length < 2) return null;
+        const desc = [...rows].sort((a,b)=>b.v-a.v);
+        const top = desc.slice(0,3);
+        const low = [...rows].sort((a,b)=>a.v-b.v).filter(r=>r.v<75).slice(0,3);
+        const fmt = list => list.map(r=>`${r.name} (${r.v}%)`).join(", ");
+        const boxS = {flex:1,border:"1px solid #bbb",padding:"4px 7px",fontSize:9.5,lineHeight:1.45,color:"#000",minWidth:0};
+        return (
+          <div style={{marginBottom:6}}>
+            <div style={RC.sectionTitle}>STRENGTHS &amp; AREAS FOR IMPROVEMENT</div>
+            <div style={{display:"flex",gap:6}}>
+              <div style={boxS}><b>Strongest subjects:</b><br/>{fmt(top)}</div>
+              <div style={boxS}><b>Needs more attention:</b><br/>{low.length ? fmt(low) : "All subjects at Exceeding Expectations — keep it up!"}</div>
+            </div>
+          </div>
+        );
+      })()}
+
+      <div style={{marginBottom:6,flex:1,display:"flex",flexDirection:"column",minHeight:56}}>
+        <div style={RC.sectionTitle}>CLASS TEACHER'S COMMENT</div>
+        <div style={{flex:1,border:"1px solid #000",background:"#fff",padding:"4px 7px",fontSize:10.5,lineHeight:1.5,whiteSpace:"pre-wrap",color:"#000"}}>
+          {comment && String(comment).trim() ? comment : ""}
         </div>
-      )}
+      </div>
+
+      <div style={{display:"flex",gap:14,marginBottom:8,marginTop:4}}>
+        {["Class Teacher's Signature","Parent / Guardian's Signature","Head Teacher's Signature & Stamp"].map(t=>(
+          <div key={t} style={{flex:1}}>
+            <div style={{height:30,borderBottom:"1px solid #000"}}></div>
+            <div style={{fontSize:8,color:"#333",marginTop:2,textAlign:"center"}}>{t}</div>
+          </div>
+        ))}
+      </div>
 
       <div style={RC.bottomRow}>
         <div style={{flex:1,minWidth:0}}>
           <div style={RC.keyTitle}>GRADING KEY</div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:8}}>
-            <thead><tr style={{background:"#000",color:"#fff"}}>
+            <thead><tr style={{background:"#ececec",color:"#000"}}>
               <th style={RC.kth}>Code</th>
               {GRADES.map(g=><th key={g.sub} style={RC.kth}>{g.sub}</th>)}
             </tr></thead>
@@ -3339,7 +3369,7 @@ function App() {
 <style>
   body{margin:0;background:#fff;font-family:Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   .no-print{display:none!important;}
-  .report-card{page-break-inside:avoid;break-inside:avoid;}
+  .report-card{page-break-inside:avoid;break-inside:avoid;min-height:0!important;height:max(240mm,min(calc(100vh - 4mm),272mm))!important;margin-bottom:0!important;}
   .report-card + .report-card{page-break-before:always;break-before:page;}
   @page{size:A4 ${isList?"landscape":"portrait"};margin:0.7cm;}
   table{border-collapse:collapse;}
@@ -4259,8 +4289,8 @@ const S = {
 };
 
 const RC = {
-  page:        {background:"#fff",color:"#000",width:"190mm",minHeight:"160mm",margin:"0 auto 4mm",padding:"7mm 8mm",fontFamily:"Arial,sans-serif",fontSize:11,boxSizing:"border-box",border:"1px solid #888"},
-  header:      {borderBottom:"3px solid #000",marginBottom:6,paddingBottom:5,textAlign:"center"},
+  page:        {background:"#fff",color:"#000",width:"190mm",minHeight:"272mm",display:"flex",flexDirection:"column",margin:"0 auto 4mm",padding:"7mm 8mm",fontFamily:"Arial,sans-serif",fontSize:11,boxSizing:"border-box",border:"1px solid #888"},
+  header:      {borderBottom:"1.5px solid #000",marginBottom:6,paddingBottom:5,textAlign:"center"},
   schoolName:  {fontSize:18,fontWeight:900,letterSpacing:1,color:"#000"},
   schoolSub:   {fontSize:9.5,color:"#444"},
   reportTitle: {fontSize:11.5,fontWeight:700,marginTop:3,color:"#000"},
@@ -4268,20 +4298,20 @@ const RC = {
   infoBlock:   {display:"flex",gap:4,alignItems:"center",flex:1},
   infoLabel:   {fontWeight:800,fontSize:8.5,color:"#444",textTransform:"uppercase"},
   infoVal:     {fontWeight:700,fontSize:10.5,color:"#000"},
-  sectionTitle:{fontWeight:900,fontSize:9.5,letterSpacing:1,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:4,textTransform:"uppercase"},
+  sectionTitle:{fontWeight:900,fontSize:9.5,letterSpacing:1,color:"#000",borderBottom:"1.5px solid #000",paddingBottom:2,marginBottom:4,textTransform:"uppercase"},
   table:       {width:"100%",borderCollapse:"collapse",marginBottom:6},
-  th:          {background:"#000",color:"#fff",padding:"3px 6px",fontWeight:700,fontSize:9.5,textAlign:"left",border:"1px solid #888"},
-  thC:         {background:"#000",color:"#fff",padding:"3px 6px",fontWeight:700,fontSize:9.5,textAlign:"center",border:"1px solid #888"},
-  td:          {padding:"3px 6px",border:"1px solid #ddd",color:"#000",fontSize:10.5},
-  tdC:         {padding:"3px 6px",border:"1px solid #ddd",textAlign:"center",color:"#000",fontSize:10.5},
-  codeBadge:   {fontWeight:900,fontSize:10.5,color:"#000",border:"1.5px solid #000",borderRadius:3,padding:"0px 5px"},
-  summaryBox:  {display:"flex",border:"2px solid #000",overflow:"hidden",marginBottom:7},
+  th:          {background:"#ececec",color:"#000",padding:"3px 6px",fontWeight:800,fontSize:9.5,textAlign:"left",border:"1px solid #777"},
+  thC:         {background:"#ececec",color:"#000",padding:"3px 6px",fontWeight:800,fontSize:9.5,textAlign:"center",border:"1px solid #777"},
+  td:          {padding:"4px 6px",border:"1px solid #ddd",color:"#000",fontSize:10.5},
+  tdC:         {padding:"4px 6px",border:"1px solid #ddd",textAlign:"center",color:"#000",fontSize:10.5},
+  codeBadge:   {fontWeight:900,fontSize:10.5,color:"#000",border:"1px solid #000",borderRadius:3,padding:"0px 5px"},
+  summaryBox:  {display:"flex",border:"1.5px solid #000",overflow:"hidden",marginBottom:7},
   summaryItem: {flex:1,padding:"4px 4px",textAlign:"center",borderRight:"1px solid #bbb"},
   sumLabel:    {fontSize:7.5,color:"#555",textTransform:"uppercase",letterSpacing:0.5},
   sumVal:      {fontSize:13,fontWeight:900,color:"#000"},
   bottomRow:   {display:"flex",gap:10,marginBottom:4},
   gradingKey:  {width:140,flexShrink:0},
-  keyTitle:    {fontWeight:900,fontSize:8.5,letterSpacing:0.5,color:"#000",borderBottom:"2px solid #000",paddingBottom:2,marginBottom:3,textTransform:"uppercase"},
+  keyTitle:    {fontWeight:900,fontSize:8.5,letterSpacing:0.5,color:"#000",borderBottom:"1.5px solid #000",paddingBottom:2,marginBottom:3,textTransform:"uppercase"},
   kth:         {padding:"2px 3px",fontWeight:700,fontSize:7.5,textAlign:"center",border:"1px solid #000"},
   ktd:         {padding:"2px 3px",textAlign:"center",fontSize:7.5,border:"1px solid #999",color:"#000"},
   datesBox:    {flex:1,border:"1px solid #bbb",borderRadius:4,padding:"5px 8px"},
